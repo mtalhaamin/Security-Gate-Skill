@@ -6,7 +6,7 @@
 
 **One command that scans your project for security problems and gives you a PDF report.**
 
-![Example report](docs/example-report.png)
+![Demo: one command, a PASS/FAIL verdict and a clickable PDF report](docs/demo.gif)
 
 Example PDF: [docs/example-report.pdf](docs/example-report.pdf) (made-up data, not a real project)
 
@@ -70,6 +70,8 @@ In the PDF, problems are ranked:
 | **L2 Low** | Low risk | Fix when you can |
 
 Every problem has its **own numbered page**. Near the start of the PDF there is an "Issue index" list: **click any row and the PDF jumps straight to that problem.**
+
+![First page of an example report](docs/example-report.png)
 
 ## Other things you can do
 
