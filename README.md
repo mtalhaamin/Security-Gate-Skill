@@ -61,6 +61,10 @@ node security-gate/scripts/gate.mjs --root "C:\path\to\your-project"
 | **FAIL** | Something serious was found. Open the PDF |
 | **INCOMPLETE** | A tool could not run, so the result is not trustworthy yet. Run the `--preflight` step |
 
+The first page of the PDF also gives a **security grade from A to E** and a **score out of 100**. The grade comes from the worst open problem (E critical, D high, C medium, B only low, A none), the same rule SonarQube uses. If a tool did not run, the grade cannot be better than C.
+
+The report also maps every problem to the **OWASP Top 10:2025** and shows a table of all 10 categories: what was checked, what was found, and which ones still need a person to review (scanners cannot judge things like access rules or app design).
+
 In the PDF, problems are ranked:
 
 | Level | Meaning | What to do |
@@ -138,4 +142,4 @@ More help, all options, and safety notes: **[docs/ADVANCED.md](docs/ADVANCED.md)
 
 Want to help? See [CONTRIBUTING.md](CONTRIBUTING.md). Found a security problem in this project? See [SECURITY.md](SECURITY.md).
 
-License: [MIT](LICENSE)
+License: [MIT](LICENSE). The PDF uses the Red Hat Display and Red Hat Text fonts by The Red Hat Project Authors, under the [SIL Open Font License 1.1](security-gate/assets/fonts/OFL.txt). This project is not made by or affiliated with Red Hat.

@@ -79,6 +79,29 @@ NuGet Audit uses your .NET SDK, no image. Images are pulled on first use; `--no-
 | L1 Medium | Medium, unknown | Fix in the current sprint |
 | L2 Low | Low, Negligible | Track, fix when convenient |
 
+### Security grade and score
+
+| Grade | When |
+|---|---|
+| A | No open findings |
+| B | Only low findings |
+| C | At least one medium finding, or a check did not run (capped at C until every check runs) |
+| D | At least one high finding |
+| E | At least one critical finding |
+
+The grade follows SonarQube's security-rating rule: the single worst open finding decides it. The score (0-100) starts at 100 and subtracts points per distinct issue: critical 25, high 10 (at most 60), medium 3 (at most 30), low 1 (at most 10). These weights are this project's own choice. The grade never changes the verdict; only `--fail-on` does. Both are in `report.json` (`score`) and on the first page of the PDF.
+
+### OWASP Top 10:2025
+
+Every finding is placed in its OWASP Top 10:2025 category, using OWASP's official CWE lists (copied into `security-gate/references/owasp-top10-2025.json`):
+
+- Vulnerable libraries (NuGet Audit, OSV-Scanner, Grype, Trivy) count as **A03 Software Supply Chain Failures**.
+- Trivy IaC / Dockerfile settings count as **A02 Security Misconfiguration**.
+- Leaked secrets count as **A07 Authentication Failures** (CWE-798, hard-coded credentials).
+- Semgrep findings use the rule's own OWASP tag (2021 tags are translated to 2025), otherwise its CWE. OWASP ZAP findings use their CWE.
+
+The PDF shows a table of all 10 categories: which checks covered it, what was found, and which categories need a person. Scanners cannot judge **A06 Insecure Design** or **A09 Logging and Alerting**, and only partly cover **A01 Broken Access Control**, so a clean table is not an OWASP Top 10 "pass".
+
 ## Output files
 
 In `<project>/.work/security-gate/`:
@@ -116,7 +139,7 @@ Real problems found while testing on an Umbraco (.NET) project:
 
 - **gitleaks reports hundreds of `generic-api-key` hits in `uSync/**/*.config`.** Those lines hold Umbraco content GUIDs, not secrets (336 of 344 flagged lines contained only GUIDs; the other 8 were short lines not inspected one by one). The gate now ranks a hit **Low** (rule id `generic-api-key:guid-like`, labelled "probable false positive") when the line holds only a GUID, so it no longer blocks the release; the remaining `generic-api-key` hits stay **High** and need a human look. Hits in git history are never downgraded. To hide them completely, use a suppression (`id` + `path`) with a reason.
 - **Which Semgrep rules run?** A general base (`p/security-audit`, `p/owasp-top-ten`, `p/secrets`, `p/cwe-top-25`, `p/xss`, `p/sql-injection`, `p/command-injection`, `p/jwt`, `p/insecure-transport`) plus one pack for each language found in the project (C#, JavaScript, TypeScript, Python, Java, Kotlin, Go, Ruby, PHP, Rust, and `p/dockerfile` when there is a Dockerfile). The report shows the chosen packs. Use `--semgrep-config` to choose your own.
-- **OSV-Scanner flags NuGet packages with a 4-part version like `10.0.0.0`.** That is the assembly version, not the package version, so it matches old advisories. The report labels these "probable false positive"; confirm the real version with `dotnet list package --include-transitive`.
+- **OSV-Scanner flags NuGet packages with a 4-part version like `10.0.0.0`.** That is the assembly version, not the package version, so it matches old advisories. The gate ranks these **Low** and labels them "probable false positive", keeping the severity the tool reported in the title (on a real Umbraco project all 16 OSV alarms were of this kind). NuGet Audit checks the real package versions; confirm with `dotnet list package --include-transitive`.
 - **Dependency scanners found nothing for .NET at first.** They read `deps.json` / `packages.lock.json`, not `.csproj`. Fixed by the publish step.
 - **Grype flags `Microsoft.AspNetCore.*` / `System.*` 10.0.13 files from `refs/`.** That is the installed .NET SDK / targeting-pack patch level, a real finding about the machine. Update the .NET SDK.
 - **Tooling folders were scanned.** OSV-Scanner initially scanned `.claude/**` lockfiles. It now scans each top-level project folder and skips dot-folders.
@@ -144,13 +167,15 @@ Real problems found while testing on an Umbraco (.NET) project:
 Security-Gate-Skill/
   README.md                    simple guide
   install-skill.mjs            copies the skill into Claude Code / Cursor / Codex / Antigravity folders
-  docs/                        this guide + example report (png, pdf)
+  docs/                        this guide, demo GIF, example report (png, pdf)
   security-gate/               the skill (Agent Skills format)
     SKILL.md                   instructions the AI tool follows
     scripts/gate.mjs           the scanner runner (Node 20+, no npm packages)
-    scripts/report-pdf.mjs     PDF builder
+    scripts/app-start.mjs      starts and stops your app for --dast-auto
+    scripts/report-pdf.mjs     PDF builder (grade, score, OWASP mapping)
     scripts/gate.selftest.mjs  offline self-test
-    references/                tool details, ignore.json template
+    references/                tool details, OWASP Top 10:2025 CWE lists, ignore.json template
+    assets/fonts/              Red Hat Display / Text fonts (SIL Open Font License)
 ```
 
 ## Limits
