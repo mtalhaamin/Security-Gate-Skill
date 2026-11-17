@@ -37,6 +37,38 @@ const SECRET_EXCLUDES = [
 ];
 const NOISE_EXCLUDES = ['node_modules', 'bin', 'obj', '.git', '.work', '.claude'];
 
+// Semgrep rulesets: a general base plus one ruleset for each language found in the project.
+const SEMGREP_BASE = ['p/security-audit', 'p/owasp-top-ten', 'p/secrets'];
+const SEMGREP_BY_EXT = {
+  '.cs': 'p/csharp', '.js': 'p/javascript', '.jsx': 'p/javascript', '.mjs': 'p/javascript', '.cjs': 'p/javascript',
+  '.ts': 'p/typescript', '.tsx': 'p/typescript', '.py': 'p/python', '.java': 'p/java', '.kt': 'p/kotlin',
+  '.go': 'p/golang', '.rb': 'p/ruby', '.php': 'p/php', '.rs': 'p/rust',
+};
+export function semgrepRulesets(exts = [], hasDockerfile = false) {
+  const sets = [...SEMGREP_BASE];
+  for (const e of [...exts].sort()) { const r = SEMGREP_BY_EXT[e.toLowerCase()]; if (r && !sets.includes(r)) sets.push(r); }
+  if (hasDockerfile) sets.push('p/dockerfile');
+  return sets;
+}
+// Walks the project (skipping dependency / build / dot folders) and returns the code file extensions and whether a Dockerfile exists.
+export function detectLanguages(root, maxFiles = 20000) {
+  const exts = new Set(); let dockerfile = false; let seen = 0;
+  const skip = new Set([...NOISE_EXCLUDES, 'vendor', 'dist', 'build', 'target', 'packages', '.venv', 'venv', '__pycache__']);
+  const walk = (dir, depth) => {
+    if (depth > 8 || seen > maxFiles) return;
+    let entries = []; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) { if (!e.name.startsWith('.') && !skip.has(e.name)) walk(path.join(dir, e.name), depth + 1); continue; }
+      seen++;
+      const ext = path.extname(e.name).toLowerCase();
+      if (SEMGREP_BY_EXT[ext]) exts.add(ext);
+      if (/^Dockerfile(\..+)?$/i.test(e.name) || /\.dockerfile$/i.test(e.name)) dockerfile = true;
+    }
+  };
+  walk(root, 0);
+  return { exts: [...exts], dockerfile };
+}
+
 // ------------------------------------------------------------------ small helpers
 export function normSeverity(s) {
   const v = String(s ?? '').toLowerCase();
@@ -88,15 +120,44 @@ const mk = (tool, p) => { const f = { tool, severity: 'high', severityKnown: tru
 const stripPre = (loc, pre) => { let s = String(loc); if (pre && s.startsWith(pre)) s = s.slice(pre.length); return s.replace(/^\/+/, ''); };
 
 // ------------------------------------------------------------------ parsers (pure, unit-tested)
-export function parseGitleaks(text, label = '', strip = '') {
+// Rules that match "anything that looks random" instead of a known token format. They are the usual source of
+// false alarms, so they are ranked High (not Critical), and a hit on a line that only holds GUIDs is ranked Low.
+const GENERIC_SECRET_RULES = new Set(['generic-api-key']);
+const GUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+// True when the line holds a GUID and nothing else that could be a secret (no other long random-looking token).
+export function looksLikeGuidOnly(line) {
+  const s = String(line || '');
+  const rest = s.replace(GUID_RE, ' ');
+  return rest.length < s.length && !/[A-Za-z0-9+/_=-]{20,}/.test(rest);
+}
+export function parseGitleaks(text, label = '', strip = '', readLine = null) {
   const arr = extractJson(text);
   if (!Array.isArray(arr)) return [];
   // Secret/Match are never copied: only rule, file, line, commit.
-  return arr.map((f) => mk('gitleaks', {
-    id: f.RuleID, severity: 'critical', title: f.Description || f.RuleID,
-    location: `${stripPre(f.File, strip)}:${f.StartLine}` + (f.Commit ? ` @${String(f.Commit).slice(0, 8)}` : ''),
-    key: f.Fingerprint || `${f.RuleID}|${f.File}|${f.StartLine}|${f.Commit || ''}`, source: label,
-  }));
+  return arr.map((f) => {
+    const rel = stripPre(f.File, strip);
+    let id = f.RuleID; let severity = 'critical'; let title = f.Description || f.RuleID;
+    if (GENERIC_SECRET_RULES.has(f.RuleID)) {
+      severity = 'high';
+      let line = ''; try { line = !f.Commit && readLine ? readLine(rel, f.StartLine) : ''; } catch { /* unreadable: keep High */ }
+      if (looksLikeGuidOnly(line)) { id = `${f.RuleID}:guid-like`; severity = 'low'; title = `[GUID-like value, probable false positive] ${title}`; }
+    }
+    return mk('gitleaks', {
+      id, severity, title,
+      location: `${rel}:${f.StartLine}` + (f.Commit ? ` @${String(f.Commit).slice(0, 8)}` : ''),
+      key: f.Fingerprint || `${f.RuleID}|${f.File}|${f.StartLine}|${f.Commit || ''}`, source: label,
+    });
+  });
+}
+// Reads one line of a file inside the scanned project (used only to classify a hit; the text is never stored).
+function projectLineReader(root) {
+  const cache = new Map();
+  return (rel, n) => {
+    const abs = path.resolve(root, rel);
+    if (!abs.startsWith(path.resolve(root))) return '';
+    if (!cache.has(abs)) { let t = ''; try { if (fs.statSync(abs).size < 5 * 1024 * 1024) t = fs.readFileSync(abs, 'utf8'); } catch { /* ignore */ } cache.set(abs, t.split(/\r?\n/)); }
+    return cache.get(abs)[n - 1] || '';
+  };
 }
 export function parseDotnetList(text) {
   const obj = extractJson(text);
@@ -347,16 +408,33 @@ function toolExec(ctx, tool, args, o = {}) {
 }
 
 // ------------------------------------------------------------------ tool runners
+// Everything .gitignore excludes (never committed, so never part of the product). Computed once per run.
+// Returns { dirs: ['a/b'], files: ['x.env'] } as paths relative to the project root; empty when it is not a git repository.
+export function parseIgnoredList(stdout) {
+  const dirs = []; const files = [];
+  for (const raw of String(stdout || '').split(/\r?\n/)) {
+    const p = raw.trim().replace(/^"|"$/g, '');
+    if (!p) continue;
+    if (p.endsWith('/')) dirs.push(p.replace(/\/+$/, '')); else files.push(p);
+  }
+  return { dirs, files };
+}
+function gitIgnored(ctx) {
+  if (ctx._ignored) return ctx._ignored;
+  const r = run('git', ['-c', 'core.quotepath=off', 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory'], { cwd: ctx.root });
+  return (ctx._ignored = r.status === 0 ? parseIgnoredList(r.stdout) : { dirs: [], files: [] });
+}
+const IGNORED_CAP = 300; // keeps the docker command line short; the rest is still covered by the fixed folder list
 function gitleaksConfig(ctx) {
   for (const f of ['.gitleaks.toml', 'gitleaks.toml']) {
     if (fs.existsSync(path.join(ctx.root, f))) return { arg: `${DP.root}/${f}`, note: `using project config ${f}` };
   }
   // gitleaks does not read .gitignore: allow-list ignored paths so gitignored secret files are not reported as repo leaks.
-  const ig = run('git', ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory'], { cwd: ctx.root });
+  const ig = gitIgnored(ctx);
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const sep = '[\\\\/]'; // regex class: backslash or slash
-  const paths = (ig.status === 0 ? ig.stdout.split(/\r?\n/).filter(Boolean) : [])
-    .map((p) => `(^|${sep})${esc(p.replace(/\/$/, '')).replace(/\//g, sep)}(${sep}|$)`);
+  const paths = [...ig.dirs, ...ig.files]
+    .map((p) => `(^|${sep})${esc(p).replace(/\//g, sep)}(${sep}|$)`);
   paths.push(`(^|${sep})(node_modules|bin|obj|\\.git)${sep}`);
   fs.writeFileSync(path.join(ctx.out, 'gitleaks.config.toml'), `[extend]\nuseDefault = true\n\n[[allowlists]]\ndescription = "gitignored and generated paths"\npaths = [\n${paths.map((p) => `  '''${p}'''`).join(',\n')}\n]\n`);
   return { arg: `${DP.out}/gitleaks.config.toml`, note: `${paths.length} ignored paths allow-listed` };
@@ -378,7 +456,7 @@ function runGitleaks(ctx) {
     const r = toolExec(ctx, 'gitleaks', [mode, ...base, '-r', `${DP.out}/${name}`, DP.root], { timeout: 15 * 60 * 1000, env });
     if (r.status !== 0 && r.status !== 2) return { status: 'ERROR', note: `gitleaks ${mode} failed (exit ${r.status}): ${tail(r.stderr || r.stdout)}`, findings: [] };
     let text = '[]'; try { text = fs.readFileSync(report, 'utf8'); } catch { if (r.status === 2) return { status: 'ERROR', note: `gitleaks ${mode} reported leaks but wrote no report`, findings: [] }; }
-    findings.push(...parseGitleaks(text, label, `${DP.root}/`));
+    findings.push(...parseGitleaks(text, label, `${DP.root}/`, mode === 'dir' ? projectLineReader(ctx.root) : null));
     notes.push(`${label}: scanned`);
   }
   return { status: 'OK', findings: dedupe(findings), note: notes.join('; ') };
@@ -405,10 +483,13 @@ function runNuget(ctx) {
 function runSemgrep(ctx) {
   const report = path.join(ctx.out, 'semgrep.json');
   try { fs.rmSync(report, { force: true }); } catch { /* ignore */ }
-  const configs = ctx.opts.semgrepConfigs.length ? ctx.opts.semgrepConfigs : ['p/security-audit', 'p/owasp-top-ten', 'p/csharp', 'p/secrets'];
+  const det = detectLanguages(ctx.root);
+  const configs = ctx.opts.semgrepConfigs.length ? ctx.opts.semgrepConfigs : semgrepRulesets(det.exts, det.dockerfile);
   const args = ['scan', '--metrics=off', '--json', '--json-output', `${DP.out}/semgrep.json`, '--quiet', '--disable-version-check'];
   for (const c of configs) args.push('--config', c);
-  for (const e of [...NOISE_EXCLUDES, ...SECRET_EXCLUDES, ...ctx.opts.excludes]) args.push('--exclude', e);
+  const ig = gitIgnored(ctx);
+  const igPaths = [...ig.dirs.map((d) => `${d}/`), ...ig.files].slice(0, IGNORED_CAP);
+  for (const e of [...NOISE_EXCLUDES, ...SECRET_EXCLUDES, ...igPaths, ...ctx.opts.excludes]) args.push('--exclude', e);
   args.push('.');
   const r = toolExec(ctx, 'semgrep', args, { timeout: 30 * 60 * 1000, workdir: DP.root });
   let text = ''; try { text = fs.readFileSync(report, 'utf8'); } catch { /* none */ }
@@ -423,9 +504,10 @@ const OSV_ROOT_FILES = /^(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|packages
 function osvTargets(ctx) {
   const out = []; let entries = [];
   try { entries = fs.readdirSync(ctx.root, { withFileTypes: true }); } catch { /* none */ }
+  const ig = gitIgnored(ctx);
   for (const e of entries) {
-    if (e.isDirectory()) { if (!e.name.startsWith('.') && !['node_modules', 'bin', 'obj'].includes(e.name)) out.push({ label: `repo/${e.name}`, args: ['-r', `${DP.root}/${e.name}`], strip: `${DP.root}/` }); }
-    else if (OSV_ROOT_FILES.test(e.name)) out.push({ label: `repo/${e.name}`, args: ['-L', `${DP.root}/${e.name}`], strip: `${DP.root}/` });
+    if (e.isDirectory()) { if (!e.name.startsWith('.') && !['node_modules', 'bin', 'obj'].includes(e.name) && !ig.dirs.includes(e.name)) out.push({ label: `repo/${e.name}`, args: ['-r', `${DP.root}/${e.name}`], strip: `${DP.root}/` }); }
+    else if (OSV_ROOT_FILES.test(e.name) && !ig.files.includes(e.name)) out.push({ label: `repo/${e.name}`, args: ['-L', `${DP.root}/${e.name}`], strip: `${DP.root}/` });
   }
   for (const p of ctx.pub) out.push({ label: `published:${p.name}`, args: ['-r', DP.pub(p.name)], strip: `${DP.pub(p.name)}/` });
   return out;
@@ -453,7 +535,12 @@ function runGrype(ctx) {
   for (const t of targets) {
     const src = t.ref ? (t.local ? `docker:${t.ref}` : `registry:${t.ref}`) : t.src;
     const args = [src, '-o', 'json', '-q'];
-    if (t.excl) for (const g of NOISE_EXCLUDES) args.push('--exclude', `./**/${g}/**`);
+    if (t.excl) {
+      for (const g of NOISE_EXCLUDES) args.push('--exclude', `./**/${g}/**`);
+      const ig = gitIgnored(ctx);
+      for (const d of ig.dirs.slice(0, IGNORED_CAP)) args.push('--exclude', `./${d}/**`);
+      for (const f of ig.files.slice(0, IGNORED_CAP)) args.push('--exclude', `./${f}`);
+    }
     const r = toolExec(ctx, 'grype', args, { timeout: 40 * 60 * 1000, env: { GRYPE_DB_CACHE_DIR: '/db' }, volumes: ['security-gate-grype-db:/db', ...(t.local ? [SOCK] : [])] });
     if (r.status !== 0) return { status: 'ERROR', findings: [], note: `grype failed on ${t.label} (exit ${r.status}): ${tail(r.stderr || r.stdout)}` };
     fs.writeFileSync(path.join(ctx.out, `grype-${t.label.replace(/[^\w.-]/g, '_')}.json`), r.stdout);
@@ -465,7 +552,10 @@ function runGrype(ctx) {
 }
 // Trivy: dependencies, IaC/Dockerfile misconfigurations and secrets in the source tree; vulnerabilities in container images.
 function runTrivy(ctx) {
-  const skip = NOISE_EXCLUDES.flatMap((g) => ['--skip-dirs', `**/${g}`]);
+  const ig = gitIgnored(ctx);
+  const skip = [...NOISE_EXCLUDES.flatMap((g) => ['--skip-dirs', `**/${g}`]),
+    ...ig.dirs.slice(0, IGNORED_CAP).flatMap((d) => ['--skip-dirs', d]),
+    ...ig.files.slice(0, IGNORED_CAP).flatMap((f) => ['--skip-files', f])];
   const targets = [{ label: 'repo', kind: 'fs', ref: DP.root, skip: true }, ...ctx.pub.map((p) => ({ label: `published:${p.name}`, kind: 'fs', ref: DP.pub(p.name) })),
     ...ctx.opts.images.map((i) => ({ label: `image:${i}`, kind: 'image', ref: i, local: imageLocal(i) }))];
   const findings = [];

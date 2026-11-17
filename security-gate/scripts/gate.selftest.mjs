@@ -3,7 +3,10 @@
 // NOTE: fixtures follow the documented output of each tool. They prove the gate logic, not that a
 // given scanner version still prints exactly this shape; the first real run of each tool confirms that.
 import assert from 'node:assert/strict';
-import { parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { parseIgnoredList, looksLikeGuidOnly, semgrepRulesets, detectLanguages, parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
 
 let n = 0; const t = (name, fn) => { fn(); n++; console.log('ok  ' + name); };
 
@@ -11,9 +14,37 @@ t('extractJson skips a banner before JSON', () => assert.deepEqual(extractJson('
 t('cvss mapping', () => { assert.equal(cvssToSeverity('9.8'), 'critical'); assert.equal(cvssToSeverity('7.5'), 'high'); assert.equal(cvssToSeverity('5'), 'medium'); assert.equal(cvssToSeverity('2'), 'low'); assert.equal(cvssToSeverity(''), null); });
 
 t('gitleaks: never copies the secret', () => {
-  const f = parseGitleaks(JSON.stringify([{ RuleID: 'generic-api-key', Description: 'key', File: 'a/b.cs', StartLine: 7, Secret: 'REDACTED', Match: 'REDACTED', Commit: 'abcdef123456', Fingerprint: 'fp1' }]));
+  const f = parseGitleaks(JSON.stringify([{ RuleID: 'aws-access-token', Description: 'key', File: 'a/b.cs', StartLine: 7, Secret: 'REDACTED', Match: 'REDACTED', Commit: 'abcdef123456', Fingerprint: 'fp1' }]));
   assert.equal(f.length, 1); assert.equal(f[0].severity, 'critical'); assert.equal(f[0].location, 'a/b.cs:7 @abcdef12');
   assert.ok(!JSON.stringify(f).includes('REDACTED'));
+});
+
+t('gitleaks: generic rule is High, GUID-only line is Low + labelled, real-looking value stays High', () => {
+  const hit = (RuleID, File, StartLine) => ({ RuleID, Description: 'd', File, StartLine, Fingerprint: `${File}:${StartLine}` });
+  const lines = { 'a.config': ['<Key>3f2504e0-4f89-41d3-9a0c-0305e82c3301</Key>'], 'b.cs': ['var k = "Zk9fQ2xpZW50U2VjcmV0MTIzNDU2Nzg5MA";'] };
+  const f = parseGitleaks(JSON.stringify([hit('generic-api-key', 'a.config', 1), hit('generic-api-key', 'b.cs', 1), hit('aws-access-token', 'c.cs', 1)]), '', '', (rel, n) => (lines[rel] || [''])[n - 1]);
+  assert.equal(f[0].severity, 'low'); assert.equal(f[0].id, 'generic-api-key:guid-like'); assert.match(f[0].title, /probable false positive/);
+  assert.equal(f[1].severity, 'high'); assert.equal(f[1].id, 'generic-api-key');
+  assert.equal(f[2].severity, 'critical');
+  assert.equal(parseGitleaks(JSON.stringify([{ ...hit('generic-api-key', 'a.config', 1), Commit: 'abc12345' }]), '', '', () => lines['a.config'][0])[0].severity, 'high'); // history hits are never downgraded
+  assert.ok(looksLikeGuidOnly('Key="3f2504e0-4f89-41d3-9a0c-0305e82c3301"')); assert.ok(!looksLikeGuidOnly('x=Zk9fQ2xpZW50U2VjcmV0MTIzNDU2 3f2504e0-4f89-41d3-9a0c-0305e82c3301')); assert.ok(!looksLikeGuidOnly('no guid here'));
+});
+
+t('gitignore: ignored dirs and files are split from git output', () => {
+  assert.deepEqual(parseIgnoredList('ignored/\r\nlocal.js\n"src/a b.env"\nbin/\n\n'), { dirs: ['ignored', 'bin'], files: ['local.js', 'src/a b.env'] });
+  assert.deepEqual(parseIgnoredList(''), { dirs: [], files: [] });
+});
+
+t('semgrep: rulesets follow the languages found in the project', () => {
+  assert.deepEqual(semgrepRulesets(['.cs']), ['p/security-audit', 'p/owasp-top-ten', 'p/secrets', 'p/csharp']);
+  assert.deepEqual(semgrepRulesets(['.ts', '.tsx', '.js'], true), ['p/security-audit', 'p/owasp-top-ten', 'p/secrets', 'p/javascript', 'p/typescript', 'p/dockerfile']);
+  assert.deepEqual(semgrepRulesets([]), ['p/security-audit', 'p/owasp-top-ten', 'p/secrets']);
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sg-lang-'));
+  try {
+    fs.mkdirSync(path.join(d, 'src')); fs.mkdirSync(path.join(d, 'node_modules')); fs.mkdirSync(path.join(d, '.work'));
+    fs.writeFileSync(path.join(d, 'src', 'a.py'), ''); fs.writeFileSync(path.join(d, 'node_modules', 'x.js'), ''); fs.writeFileSync(path.join(d, '.work', 'y.go'), ''); fs.writeFileSync(path.join(d, 'Dockerfile'), '');
+    const r = detectLanguages(d); assert.deepEqual(r.exts, ['.py']); assert.equal(r.dockerfile, true);
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
 });
 
 t('nuget: severities, transitive, dedupe, problems', () => {
