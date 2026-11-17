@@ -42,10 +42,10 @@ Every scanner runs in its **official Docker image**; nothing is installed on the
    - Default `--tool all` = **sca** (NuGet Audit + OSV-Scanner), **sast** (Semgrep), **secrets** (gitleaks), **container** (Trivy + Grype
      on the source tree and, for .NET, the published output). Pick groups with `--tool sca|sast|secrets|container|dast[,..]`.
    - **Image scan**: `--image myapp:tag` (repeatable). A local image is scanned through the Docker socket, otherwise from the registry.
-   - **DAST**: start the app locally, then `--dast-url http://localhost:PORT` (adds ZAP; `--tool dast` runs only ZAP).
+   - **DAST**: start the app locally, then `--dast-url http://localhost:PORT` (adds ZAP; `--tool dast` runs only ZAP). Or let the gate start it: `--dast-auto` (ASP.NET Core, Node.js, Django; it finds the start command, picks a free port, stops the app afterwards) or `--dast-start "<command with {port}>"` for any other stack. Both run the project's own code, so **ask the user first**.
    - The first run is slow (image pulls, Semgrep rules, Trivy/Grype databases); run it in the background if it may exceed 2 minutes.
    - Other flags: `--fail-on critical|high|medium|low` (default high), `--skip a,b` (makes the gate INCOMPLETE), `--no-history`,
-     `--no-publish`, `--semgrep-config p/<ruleset>`, `--no-pdf`, `--keep`.
+     `--no-publish`, `--semgrep-config p/<ruleset>` (replaces the automatic rules) or `--semgrep-extra p/<ruleset>` (adds to them), `--no-pdf`, `--keep`.
 3. **Reports** are written automatically to `<out>/`: `security-report.pdf` (key points, "Fix first" table, per-tool status, findings
    grouped **L0 = High, L1 = Medium, L2 = Low** with the action for each), `report.md`, `report.json` and raw tool output.
    L0 = critical + high severity, L1 = medium (and unknown), L2 = low. Rebuild only the PDF with

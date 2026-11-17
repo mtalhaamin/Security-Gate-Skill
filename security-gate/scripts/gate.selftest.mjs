@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { detectApp, startApp, freePort } from './app-start.mjs';
 import { parseIgnoredList, looksLikeGuidOnly, semgrepRulesets, detectLanguages, parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
 
 let n = 0; const t = (name, fn) => { fn(); n++; console.log('ok  ' + name); };
@@ -30,15 +31,45 @@ t('gitleaks: generic rule is High, GUID-only line is Low + labelled, real-lookin
   assert.ok(looksLikeGuidOnly('Key="3f2504e0-4f89-41d3-9a0c-0305e82c3301"')); assert.ok(!looksLikeGuidOnly('x=Zk9fQ2xpZW50U2VjcmV0MTIzNDU2 3f2504e0-4f89-41d3-9a0c-0305e82c3301')); assert.ok(!looksLikeGuidOnly('no guid here'));
 });
 
+t('dast-auto: finds out how to start .NET, Node and Django apps', () => {
+  const mk = (files) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sg-app-')); for (const [p, c] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(d, p)), { recursive: true }); fs.writeFileSync(path.join(d, p), c); } return d; };
+  const dirs = [];
+  try {
+    const net = mk({ 'src/Site/Site.csproj': '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>', 'src/Site/Program.cs': '', 'src/Site.Tests/Site.Tests.csproj': '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>', 'src/Lib/Lib.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>' }); dirs.push(net);
+    const a = detectApp(net); assert.equal(a.kind, 'dotnet'); assert.match(a.cmd, /dotnet run --project "src\/Site\/Site\.csproj" --urls http:\/\/localhost:\{port\}/); assert.equal(a.others, 1);
+    const nodeNo = mk({ 'package.json': JSON.stringify({ scripts: { dev: 'next dev' }, dependencies: { next: '15' } }) }); dirs.push(nodeNo);
+    const b = detectApp(nodeNo); assert.equal(b.kind, 'node'); assert.equal(b.cmd, 'npm run dev -- -p {port}'); assert.equal(b.problems.length, 1); // node_modules missing
+    const nodeOk = mk({ 'package.json': JSON.stringify({ scripts: { start: 'node s.js' } }), 'node_modules/.keep': '' }); dirs.push(nodeOk);
+    const c = detectApp(nodeOk); assert.equal(c.cmd, 'npm run start'); assert.equal(c.problems.length, 0);
+    const dj = mk({ 'site/manage.py': '' }); dirs.push(dj);
+    assert.equal(detectApp(dj).kind, 'django');
+    const none = mk({ 'README.md': 'x' }); dirs.push(none);
+    assert.equal(detectApp(none), null);
+    const ign = mk({ 'node_modules/x/Site.csproj': '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>' }); dirs.push(ign);
+    assert.equal(detectApp(ign), null); // dependency folders are never searched
+  } finally { for (const d of dirs) fs.rmSync(d, { recursive: true, force: true }); }
+});
+
+t('dast-auto: a free port is found and an app that exits at once is reported, not hung', () => {
+  assert.ok(freePort() > 0);
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sg-start-'));
+  try {
+    const r = startApp({ command: `"${process.execPath}" -e "process.exit(3)"`, cwd: d, port: freePort(), logFile: path.join(d, 'app.log'), timeoutMs: 30000 });
+    assert.equal(r.ok, false); assert.match(r.note, /exited before it answered/);
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
+});
+
 t('gitignore: ignored dirs and files are split from git output', () => {
   assert.deepEqual(parseIgnoredList('ignored/\r\nlocal.js\n"src/a b.env"\nbin/\n\n'), { dirs: ['ignored', 'bin'], files: ['local.js', 'src/a b.env'] });
   assert.deepEqual(parseIgnoredList(''), { dirs: [], files: [] });
 });
 
 t('semgrep: rulesets follow the languages found in the project', () => {
-  assert.deepEqual(semgrepRulesets(['.cs']), ['p/security-audit', 'p/owasp-top-ten', 'p/secrets', 'p/csharp']);
-  assert.deepEqual(semgrepRulesets(['.ts', '.tsx', '.js'], true), ['p/security-audit', 'p/owasp-top-ten', 'p/secrets', 'p/javascript', 'p/typescript', 'p/dockerfile']);
-  assert.deepEqual(semgrepRulesets([]), ['p/security-audit', 'p/owasp-top-ten', 'p/secrets']);
+  const BASE = ['p/security-audit', 'p/owasp-top-ten', 'p/secrets', 'p/cwe-top-25', 'p/xss', 'p/sql-injection', 'p/command-injection', 'p/jwt', 'p/insecure-transport'];
+  assert.deepEqual(semgrepRulesets(['.cs']), [...BASE, 'p/csharp']);
+  assert.deepEqual(semgrepRulesets(['.ts', '.tsx', '.js'], true), [...BASE, 'p/javascript', 'p/typescript', 'p/react', 'p/dockerfile']);
+  assert.deepEqual(semgrepRulesets(['.py'], false, true), [...BASE, 'p/python', 'p/django']);
+  assert.deepEqual(semgrepRulesets([]), BASE);
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sg-lang-'));
   try {
     fs.mkdirSync(path.join(d, 'src')); fs.mkdirSync(path.join(d, 'node_modules')); fs.mkdirSync(path.join(d, '.work'));

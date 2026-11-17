@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildPdf, priorityOf } from './report-pdf.mjs';
+import { detectApp, freePort, startApp, stopApp } from './app-start.mjs';
 
 export const TOOLS = ['gitleaks', 'nuget', 'semgrep', 'osv', 'grype', 'trivy', 'zap'];
 // Tool groups (same names as the team's scan.ps1): -Tool sca|sast|secrets|container|dast|all
@@ -38,21 +39,25 @@ const SECRET_EXCLUDES = [
 const NOISE_EXCLUDES = ['node_modules', 'bin', 'obj', '.git', '.work', '.claude'];
 
 // Semgrep rulesets: a general base plus one ruleset for each language found in the project.
-const SEMGREP_BASE = ['p/security-audit', 'p/owasp-top-ten', 'p/secrets'];
+const SEMGREP_BASE = ['p/security-audit', 'p/owasp-top-ten', 'p/secrets', 'p/cwe-top-25', 'p/xss', 'p/sql-injection', 'p/command-injection', 'p/jwt', 'p/insecure-transport'];
+const SEMGREP_FRAMEWORK_BY_EXT = { '.jsx': 'p/react', '.tsx': 'p/react' };
 const SEMGREP_BY_EXT = {
   '.cs': 'p/csharp', '.js': 'p/javascript', '.jsx': 'p/javascript', '.mjs': 'p/javascript', '.cjs': 'p/javascript',
   '.ts': 'p/typescript', '.tsx': 'p/typescript', '.py': 'p/python', '.java': 'p/java', '.kt': 'p/kotlin',
   '.go': 'p/golang', '.rb': 'p/ruby', '.php': 'p/php', '.rs': 'p/rust',
 };
-export function semgrepRulesets(exts = [], hasDockerfile = false) {
+export function semgrepRulesets(exts = [], hasDockerfile = false, hasDjango = false) {
   const sets = [...SEMGREP_BASE];
-  for (const e of [...exts].sort()) { const r = SEMGREP_BY_EXT[e.toLowerCase()]; if (r && !sets.includes(r)) sets.push(r); }
+  for (const e of [...exts].sort()) {
+    for (const r of [SEMGREP_BY_EXT[e.toLowerCase()], SEMGREP_FRAMEWORK_BY_EXT[e.toLowerCase()]]) if (r && !sets.includes(r)) sets.push(r);
+  }
+  if (hasDjango) sets.push('p/django');
   if (hasDockerfile) sets.push('p/dockerfile');
   return sets;
 }
 // Walks the project (skipping dependency / build / dot folders) and returns the code file extensions and whether a Dockerfile exists.
 export function detectLanguages(root, maxFiles = 20000) {
-  const exts = new Set(); let dockerfile = false; let seen = 0;
+  const exts = new Set(); let dockerfile = false; let django = false; let seen = 0;
   const skip = new Set([...NOISE_EXCLUDES, 'vendor', 'dist', 'build', 'target', 'packages', '.venv', 'venv', '__pycache__']);
   const walk = (dir, depth) => {
     if (depth > 8 || seen > maxFiles) return;
@@ -62,11 +67,12 @@ export function detectLanguages(root, maxFiles = 20000) {
       seen++;
       const ext = path.extname(e.name).toLowerCase();
       if (SEMGREP_BY_EXT[ext]) exts.add(ext);
+      if (e.name === 'manage.py') django = true;
       if (/^Dockerfile(\..+)?$/i.test(e.name) || /\.dockerfile$/i.test(e.name)) dockerfile = true;
     }
   };
   walk(root, 0);
-  return { exts: [...exts], dockerfile };
+  return { exts: [...exts], dockerfile, django };
 }
 
 // ------------------------------------------------------------------ small helpers
@@ -484,7 +490,7 @@ function runSemgrep(ctx) {
   const report = path.join(ctx.out, 'semgrep.json');
   try { fs.rmSync(report, { force: true }); } catch { /* ignore */ }
   const det = detectLanguages(ctx.root);
-  const configs = ctx.opts.semgrepConfigs.length ? ctx.opts.semgrepConfigs : semgrepRulesets(det.exts, det.dockerfile);
+  const configs = [...(ctx.opts.semgrepConfigs.length ? ctx.opts.semgrepConfigs : semgrepRulesets(det.exts, det.dockerfile, det.django)), ...ctx.opts.semgrepExtra.filter((c) => !ctx.opts.semgrepConfigs.includes(c))];
   const args = ['scan', '--metrics=off', '--json', '--json-output', `${DP.out}/semgrep.json`, '--quiet', '--disable-version-check'];
   for (const c of configs) args.push('--config', c);
   const ig = gitIgnored(ctx);
@@ -578,6 +584,29 @@ function runTrivy(ctx) {
 // OWASP ZAP (DAST). Baseline = passive scan (safe). Full = active attacks, needs explicit confirmation.
 function runZap(ctx) {
   const o = ctx.opts;
+  if (!(o.dastAuto || o.dastStart)) return runZapOn(ctx, o.dastUrl);
+  // The gate starts the project's own app on a free local port, scans it, and always stops it again.
+  let command = o.dastStart; let cwd = ctx.root; let how = 'your --dast-start command';
+  if (!command) {
+    const app = detectApp(ctx.root);
+    if (!app) return { status: 'ERROR', findings: [], note: 'could not tell how to start this project (supported: ASP.NET Core, Node.js, Django). Start it yourself and use --dast-url, or give --dast-start "<command with {port}>"' };
+    if (app.problems.length) return { status: 'ERROR', findings: [], note: `${app.label}: ${app.problems.join('; ')}` };
+    command = app.cmd; cwd = app.cwd; how = app.label + (app.others ? ` (${app.others} other app(s) found; use --dast-start to pick another)` : '');
+  }
+  let port = 0;
+  if (o.dastUrl) { try { port = parseInt(new URL(o.dastUrl).port, 10) || 0; } catch { /* ignore */ } }
+  if (!port) port = freePort();
+  if (!port) return { status: 'ERROR', findings: [], note: 'could not find a free local port' };
+  console.log(`  starting the app: ${command.replace(/\{port\}/g, String(port))}   [${how}]`);
+  const app = startApp({ command, cwd, port, logFile: path.join(ctx.out, 'dast-app.log') });
+  if (!app.ok) return { status: 'ERROR', findings: [], note: app.note };
+  try {
+    const r = runZapOn(ctx, app.url);
+    return { ...r, note: `${r.note}; app started by the gate (${how}) and stopped afterwards` };
+  } finally { stopApp(app); }
+}
+function runZapOn(ctx, dastUrl) {
+  const o = { ...ctx.opts, dastUrl };
   const chk = checkDastTarget(o.dastUrl, o.dastAllow);
   if (!chk.ok) return { status: 'ERROR', findings: [], note: chk.reason };
   const script = o.dastFull ? 'zap-full-scan.py' : 'zap-baseline.py';
@@ -633,7 +662,7 @@ function writeReports(ctx, results, ev, skipped, ignores, extraNotes) {
 
 // ------------------------------------------------------------------ main
 function parseArgs(argv) {
-  const o = { root: process.cwd(), out: '', failOn: 'high', tool: ['all'], only: [], skip: [], ignore: '', semgrepConfigs: [], excludes: [], images: [], dastUrl: '', dastAllow: [], dastFull: false, dastConfirm: false, dastMinutes: 1,
+  const o = { root: process.cwd(), out: '', failOn: 'high', tool: ['all'], only: [], skip: [], ignore: '', semgrepConfigs: [], semgrepExtra: [], excludes: [], images: [], dastUrl: '', dastAuto: false, dastStart: '', dastAllow: [], dastFull: false, dastConfirm: false, dastMinutes: 1,
     noPull: false, preflight: false, noPublish: false, keep: false, noHistory: false, noPdf: false, help: false };
   const val = (i) => { if (i + 1 >= argv.length) throw new Error(`${argv[i]} needs a value`); return argv[i + 1]; };
   const list = (s) => s.split(',').map((x) => x.trim()).filter(Boolean);
@@ -643,9 +672,10 @@ function parseArgs(argv) {
     else if (a === '--fail-on') o.failOn = val(i++).toLowerCase();
     else if (a === '--tool') o.tool = list(val(i++)); else if (a === '--only') o.only = list(val(i++)); else if (a === '--skip') o.skip = list(val(i++));
     else if (a === '--ignore') o.ignore = val(i++);
-    else if (a === '--semgrep-config') o.semgrepConfigs.push(val(i++)); else if (a === '--exclude') o.excludes.push(val(i++));
+    else if (a === '--semgrep-config') o.semgrepConfigs.push(val(i++)); else if (a === '--semgrep-extra') o.semgrepExtra.push(val(i++)); else if (a === '--exclude') o.excludes.push(val(i++));
     else if (a === '--image') o.images.push(val(i++));
-    else if (a === '--dast-url') o.dastUrl = val(i++); else if (a === '--dast-allow-host') o.dastAllow.push(val(i++));
+    else if (a === '--dast-url') o.dastUrl = val(i++); else if (a === '--dast-auto') o.dastAuto = true; else if (a === '--dast-start') o.dastStart = val(i++);
+    else if (a === '--dast-allow-host') o.dastAllow.push(val(i++));
     else if (a === '--dast-full') o.dastFull = true; else if (a === '--i-am-authorized') o.dastConfirm = true;
     else if (a === '--dast-minutes') o.dastMinutes = Math.max(1, parseInt(val(i++), 10) || 1);
     else if (a === '--no-pull') o.noPull = true;
@@ -656,7 +686,8 @@ function parseArgs(argv) {
   if (!SEV[o.failOn]) throw new Error('--fail-on must be critical, high, medium or low');
   for (const t of [...o.only, ...o.skip]) if (!TOOLS.includes(t)) throw new Error(`unknown tool "${t}" (valid: ${TOOLS.join(', ')})`);
   for (const g of o.tool) if (g !== 'all' && !GROUPS[g]) throw new Error(`unknown --tool "${g}" (valid: all, ${Object.keys(GROUPS).join(', ')})`);
-  if ((o.tool.includes('dast') || o.only.includes('zap')) && !o.dastUrl) throw new Error('DAST needs --dast-url <http://localhost:PORT> (the app must be running)');
+  if ((o.tool.includes('dast') || o.only.includes('zap')) && !o.dastUrl && !o.dastAuto && !o.dastStart) throw new Error('DAST needs --dast-url <http://localhost:PORT> (the app must be running) or --dast-auto (the gate starts the app itself)');
+  if (o.dastStart && !/\{port\}/.test(o.dastStart) && !o.dastUrl) throw new Error('--dast-start needs {port} in the command (or a --dast-url with the port the app will use)');
   if (o.dastFull && !o.dastConfirm) throw new Error('--dast-full sends ACTIVE attack traffic; add --i-am-authorized only if you own or are authorised to test the target');
   return o;
 }
@@ -664,9 +695,11 @@ const HELP = `security-gate (Docker-first): sca + sast + secrets + container (+ 
   node gate.mjs [--root <dir>] [--out <dir>] [--fail-on critical|high|medium|low]
                 [--tool all|sca|sast|secrets|container|dast[,..]]  [--only a,b] [--skip a,b]
                 [--image <ref>]...                       scan a container image (local image via the Docker socket)
-                [--dast-url <url> [--dast-full --i-am-authorized] [--dast-allow-host <h>] [--dast-minutes n]]
+                [--dast-url <url> | --dast-auto | --dast-start "<cmd with {port}>"]   scan a running app with OWASP ZAP (local only)
+                    --dast-auto   the gate finds how to start the app (ASP.NET Core, Node.js, Django), starts it, scans it, stops it
+                [--dast-full --i-am-authorized] [--dast-allow-host <h>] [--dast-minutes n]
                 [--preflight] [--no-pull] [--no-publish] [--no-history] [--no-pdf]
-                [--ignore <file>] [--semgrep-config <cfg>]... [--exclude <glob>]... [--keep]
+                [--ignore <file>] [--semgrep-config <cfg>]... [--semgrep-extra <cfg>]... [--exclude <glob>]... [--keep]
   groups: sca = nuget + osv, sast = semgrep, secrets = gitleaks, container = trivy + grype, dast = zap
   needs : Docker Desktop (started automatically on Windows), .NET SDK (for nuget), Node 20+
   images: pulled on first use (sizes printed; --no-pull forbids it); versions pinned, override with SECURITY_GATE_IMAGE_<TOOL>
@@ -678,8 +711,8 @@ function main() {
   if (opts.help) { console.log(HELP); return 0; }
   const root = path.resolve(opts.root);
   const out = path.resolve(root, opts.out || path.join('.work', 'security-gate'));
-  const selected = selectTools({ tool: opts.tool, only: opts.only, skip: opts.skip, dast: !!opts.dastUrl });
-  const wanted = selectTools({ tool: ['all'], only: [], skip: [], dast: !!opts.dastUrl });
+  const selected = selectTools({ tool: opts.tool, only: opts.only, skip: opts.skip, dast: !!(opts.dastUrl || opts.dastAuto || opts.dastStart) });
+  const wanted = selectTools({ tool: ['all'], only: [], skip: [], dast: !!(opts.dastUrl || opts.dastAuto || opts.dastStart) });
   // --skip makes the gate INCOMPLETE; a deliberate scope (--tool / --only) is reported as a partial scan instead.
   const skipped = opts.skip.filter((t) => wanted.includes(t));
   const outOfScope = wanted.filter((t) => !selected.includes(t) && !opts.skip.includes(t));
@@ -711,7 +744,7 @@ function main() {
     let problems = dotnetVersion ? 0 : 1;
     for (const t of ['gitleaks', 'semgrep', 'osv', 'grype', 'trivy', 'zap']) {
       const local = dVer && imageLocal(imageOf(t));
-      console.log(`  ${t.padEnd(9)} ${local ? 'OK       image ready ' + imageOf(t) : `will pull ${imageOf(t)} (~${IMAGES[t].mb ?? '?'} MB) on first use${t === 'zap' ? ' (only for --dast-url)' : ''}`}`);
+      console.log(`  ${t.padEnd(9)} ${local ? 'OK       image ready ' + imageOf(t) : `will pull ${imageOf(t)} (~${IMAGES[t].mb ?? '?'} MB) on first use${t === 'zap' ? ' (only for --dast-url / --dast-auto)' : ''}`}`);
     }
     if (!dVer) problems++;
     console.log('Network needed on first run: image pulls, Semgrep rules, Trivy/Grype databases, nuget.org.');

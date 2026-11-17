@@ -13,6 +13,8 @@ node security-gate/scripts/gate.mjs [options]
   --only a,b / --skip a   tools: gitleaks, nuget, semgrep, osv, grype, trivy, zap  (--skip makes the gate INCOMPLETE)
   --image <ref>           scan a container image (repeatable)
   --dast-url <url>        add OWASP ZAP against a running app (local targets only)
+  --dast-auto             the gate starts your app itself (ASP.NET Core, Node.js, Django), scans it, then stops it
+  --dast-start "<cmd>"    same, with your own start command for any stack; write {port} where the port goes, e.g. "python app.py --port {port}"
   --dast-full --i-am-authorized   ACTIVE ZAP scan (attack traffic): only for apps you own
   --dast-allow-host <h>   allow a non-local DAST host you own  (repeatable)
   --dast-minutes <n>      ZAP spider time (default 1)
@@ -22,6 +24,7 @@ node security-gate/scripts/gate.mjs [options]
   --no-history            skip the gitleaks git-history scan
   --no-pdf                skip the PDF
   --semgrep-config <cfg>  your own semgrep rule packs (repeatable); replaces the automatic choice
+  --semgrep-extra <cfg>   one more semgrep pack ON TOP of the automatic ones (repeatable), e.g. p/nextjs
   --exclude <glob>        extra semgrep exclude (repeatable)
   --ignore <file>         suppressions file (default: <root>/.security-gate/ignore.json)
   --keep                  keep the temp publish folder
@@ -112,7 +115,7 @@ node install-skill.mjs --agent all --project /path/to/project --agents-md
 Real problems found while testing on an Umbraco (.NET) project:
 
 - **gitleaks reports hundreds of `generic-api-key` hits in `uSync/**/*.config`.** Those lines hold Umbraco content GUIDs, not secrets (336 of 344 flagged lines contained only GUIDs; the other 8 were short lines not inspected one by one). The gate now ranks a hit **Low** (rule id `generic-api-key:guid-like`, labelled "probable false positive") when the line holds only a GUID, so it no longer blocks the release; the remaining `generic-api-key` hits stay **High** and need a human look. Hits in git history are never downgraded. To hide them completely, use a suppression (`id` + `path`) with a reason.
-- **Which Semgrep rules run?** A general base (`p/security-audit`, `p/owasp-top-ten`, `p/secrets`) plus one pack for each language found in the project (C#, JavaScript, TypeScript, Python, Java, Kotlin, Go, Ruby, PHP, Rust, and `p/dockerfile` when there is a Dockerfile). The report shows the chosen packs. Use `--semgrep-config` to choose your own.
+- **Which Semgrep rules run?** A general base (`p/security-audit`, `p/owasp-top-ten`, `p/secrets`, `p/cwe-top-25`, `p/xss`, `p/sql-injection`, `p/command-injection`, `p/jwt`, `p/insecure-transport`) plus one pack for each language found in the project (C#, JavaScript, TypeScript, Python, Java, Kotlin, Go, Ruby, PHP, Rust, and `p/dockerfile` when there is a Dockerfile). The report shows the chosen packs. Use `--semgrep-config` to choose your own.
 - **OSV-Scanner flags NuGet packages with a 4-part version like `10.0.0.0`.** That is the assembly version, not the package version, so it matches old advisories. The report labels these "probable false positive"; confirm the real version with `dotnet list package --include-transitive`.
 - **Dependency scanners found nothing for .NET at first.** They read `deps.json` / `packages.lock.json`, not `.csproj`. Fixed by the publish step.
 - **Grype flags `Microsoft.AspNetCore.*` / `System.*` 10.0.13 files from `refs/`.** That is the installed .NET SDK / targeting-pack patch level, a real finding about the machine. Update the .NET SDK.
@@ -128,6 +131,7 @@ Real problems found while testing on an Umbraco (.NET) project:
 ## Safety rules
 
 - Scanners run in containers with the project mounted **read-only**. Only the report folder is writable.
+- `--dast-auto` and `--dast-start` run **your project's own code** on your computer (for example `dotnet run` or `npm run start`), on `localhost` only, and always stop it again. The app's output goes to `dast-app.log` in the report folder. Node.js projects need `npm install` done first; the gate never installs anything for you. Tested on ASP.NET Core and Node.js; Django is supported but not yet tested on a real project.
 - Files and folders listed in your `.gitignore` are skipped by every scanner (gitleaks, Semgrep, OSV-Scanner, Grype, Trivy), because they are never committed. This needs a git repository; without one only the fixed folder list (`node_modules`, `bin`, `obj`, ...) is skipped. Docker images and the published .NET output are not affected.
 - Secret values are never copied: gitleaks runs with `--redact`; Semgrep and Trivy findings are cut down to rule + location. Secret files (`appsettings.Development.json`, `.env*`, `*.pfx`, ...) are excluded from Semgrep.
 - Local images are scanned through the Docker socket, which gives that container control of the Docker engine. Fine on a developer machine; avoid on shared CI runners (scan from the registry instead).
