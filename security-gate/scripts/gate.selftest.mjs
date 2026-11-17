@@ -7,9 +7,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { detectApp, startApp, freePort } from './app-start.mjs';
-import { parseIgnoredList, looksLikeGuidOnly, semgrepRulesets, detectLanguages, parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
+import { parseIgnoredList, trivySkipArgs, looksLikeGuidOnly, semgrepRulesets, detectLanguages, parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
 
 let n = 0; const t = (name, fn) => { fn(); n++; console.log('ok  ' + name); };
+
+t('trivy: ignored paths are passed as container paths, which Trivy matches', () => {
+  const a = trivySkipArgs({ dirs: ['src/App/umbraco'], files: ['src/App/appsettings.Development.json'] });
+  assert.ok(a.join(' ').includes('--skip-files /src/src/App/appsettings.Development.json'));
+  assert.ok(a.join(' ').includes('--skip-dirs /src/src/App/umbraco'));
+  assert.ok(!a.includes('src/App/appsettings.Development.json') && !a.includes('src/App/umbraco'));   // the relative form is the bug
+  assert.ok(a.includes('**/node_modules'));                                                            // the noise folders stay
+});
 
 t('extractJson skips a banner before JSON', () => assert.deepEqual(extractJson('warn: x\n{"a":1}'), { a: 1 }));
 t('cvss mapping', () => { assert.equal(cvssToSeverity('9.8'), 'critical'); assert.equal(cvssToSeverity('7.5'), 'high'); assert.equal(cvssToSeverity('5'), 'medium'); assert.equal(cvssToSeverity('2'), 'low'); assert.equal(cvssToSeverity(''), null); });

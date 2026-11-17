@@ -556,12 +556,18 @@ function runGrype(ctx) {
   }
   return { status: 'OK', findings: dedupe(findings), note: `scanned: ${targets.map((t) => t.label).join(', ')}` };
 }
+// Trivy matches --skip-dirs / --skip-files against the path it sees inside the container, so a path relative to the
+// project root (src/App/appsettings.Development.json) matches nothing and the file is scanned anyway. The container
+// path (/src/...) matches, so the ignored paths are given in that form.
+export function trivySkipArgs(ig) {
+  return [...NOISE_EXCLUDES.flatMap((g) => ['--skip-dirs', `**/${g}`]),
+    ...ig.dirs.slice(0, IGNORED_CAP).flatMap((d) => ['--skip-dirs', `${DP.root}/${d}`]),
+    ...ig.files.slice(0, IGNORED_CAP).flatMap((f) => ['--skip-files', `${DP.root}/${f}`])];
+}
 // Trivy: dependencies, IaC/Dockerfile misconfigurations and secrets in the source tree; vulnerabilities in container images.
 function runTrivy(ctx) {
   const ig = gitIgnored(ctx);
-  const skip = [...NOISE_EXCLUDES.flatMap((g) => ['--skip-dirs', `**/${g}`]),
-    ...ig.dirs.slice(0, IGNORED_CAP).flatMap((d) => ['--skip-dirs', d]),
-    ...ig.files.slice(0, IGNORED_CAP).flatMap((f) => ['--skip-files', f])];
+  const skip = trivySkipArgs(ig);
   const targets = [{ label: 'repo', kind: 'fs', ref: DP.root, skip: true }, ...ctx.pub.map((p) => ({ label: `published:${p.name}`, kind: 'fs', ref: DP.pub(p.name) })),
     ...ctx.opts.images.map((i) => ({ label: `image:${i}`, kind: 'image', ref: i, local: imageLocal(i) }))];
   const findings = [];
