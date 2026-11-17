@@ -1,0 +1,18 @@
+{
+  "ignore": [
+    {
+      "tool": "grype",
+      "id": "CVE-2099-0001",
+      "package": "Example.Package@1.2.3",
+      "reason": "Vulnerable code path not used; upgrade planned in ticket ABC-123",
+      "expires": "2099-01-31"
+    },
+    {
+      "tool": "semgrep",
+      "id": "csharp.lang.security.example-rule",
+      "path": "Tests/",
+      "reason": "Test fixture, never deployed",
+      "expires": "2099-06-30"
+    }
+  ]
+}

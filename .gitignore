@@ -1,0 +1,14 @@
+# Scanner binaries, the semgrep venv and the grype database are installed by install-tools.ps1; never commit them
+# (grype.exe alone is ~90 MB, GitHub rejects files over 100 MB).
+tools/
+
+# Output written when the gate is run inside this repository
+.work/
+node_modules/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
