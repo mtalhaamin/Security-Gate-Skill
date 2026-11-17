@@ -42,8 +42,8 @@ function agentsMdBlock(rel) {
 
 When asked to run the security gate, scan this repository for secrets or vulnerabilities, or check it is clean before a commit, PR or release, use the \`security-gate\` skill at \`${rel}/security-gate/SKILL.md\` (follow it exactly). In short:
 
-1. Tell the user once that the first run pulls official Docker images (about 0.6 GB, plus 1.1 GB for ZAP if DAST is used) and wait for their yes. Needs Docker Desktop and the .NET SDK.
-2. \`node ${rel}/security-gate/scripts/gate.mjs --root .\` runs OSV-Scanner + NuGet Audit, Semgrep, gitleaks, Trivy + Grype (add \`--dast-url http://localhost:PORT\` for OWASP ZAP, local targets only) and writes \`.work/security-gate/security-report.pdf\` (findings ranked L0 High, L1 Medium, L2 Low).
+1. Tell the user once that the first run pulls official Docker images (about 0.6 GB, plus 1.1 GB for ZAP if DAST is used) and wait for their yes. Needs Docker Desktop and Node.js 20+; the .NET SDK only for .NET projects.
+2. \`node ${rel}/security-gate/scripts/gate.mjs --root .\` runs OSV-Scanner + NuGet Audit, Semgrep, gitleaks, Trivy + Grype (for OWASP ZAP add \`--dast-auto\` to let the gate start, scan and stop the app, or \`--dast-url http://localhost:PORT\` for an app that is already running; local targets only; ask the user first, because \`--dast-auto\` runs the project's code) and writes \`.work/security-gate/security-report.pdf\` (findings ranked L0 High, L1 Medium, L2 Low).
 3. Exit code 0 = PASS, 1 = FAIL, 2 = INCOMPLETE. Never call the repo clean unless the verdict is PASS. Never print secret values.
 ${MARK_END}
 `;
@@ -79,7 +79,7 @@ function main() {
     console.log(`${o.dry ? 'would update' : 'update'} ${f}`);
     if (!o.dry) fs.writeFileSync(f, t);
   }
-  console.log('Needs Docker Desktop and the .NET SDK. The first gate run pulls the official scanner images (sizes are printed).');
+  console.log('Needs Docker Desktop and Node.js 20+ (the .NET SDK only for .NET projects). The first gate run pulls the official scanner images (sizes are printed).');
   console.log('Restart the agent so it picks up the new skill.');
   return 0;
 }
