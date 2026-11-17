@@ -56,7 +56,7 @@ t('dast-auto: a free port is found and an app that exits at once is reported, no
   try {
     const r = startApp({ command: `"${process.execPath}" -e "process.exit(3)"`, cwd: d, port: freePort(), logFile: path.join(d, 'app.log'), timeoutMs: 30000 });
     assert.equal(r.ok, false); assert.match(r.note, /exited before it answered/);
-  } finally { fs.rmSync(d, { recursive: true, force: true }); }
+  } finally { fs.rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }); }
 });
 
 t('gitignore: ignored dirs and files are split from git output', () => {

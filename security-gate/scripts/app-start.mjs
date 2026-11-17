@@ -63,7 +63,14 @@ export function freePort() {
 }
 
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-function alive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+// True while the process is running. On Linux/macOS a finished child stays a "zombie" until Node reaps it, and Node cannot
+// do that while this script waits, so process.kill(pid, 0) would still say "alive"; ps shows the real state (Z = finished).
+function alive(pid) {
+  if (process.platform === 'win32') { try { process.kill(pid, 0); return true; } catch { return false; } }
+  const r = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 10000 });
+  const st = String(r.stdout || '').trim();
+  return !!st && !st.startsWith('Z');
+}
 function httpAnswers(url) { // any HTTP answer (even 404 or 500) means the server is up
   const r = spawnSync(process.execPath, ['-e', `fetch(${JSON.stringify(url)},{signal:AbortSignal.timeout(5000),redirect:'manual'}).then(()=>process.exit(0),()=>process.exit(1))`], { timeout: 15000 });
   return r.status === 0;
@@ -77,6 +84,7 @@ export function startApp({ command, cwd, port, logFile, timeoutMs = 4 * 60 * 100
   const win = process.platform === 'win32';
   const child = spawn(cmd, { cwd, shell: true, detached: !win, windowsHide: true, stdio: ['ignore', fd, fd], env: { ...process.env, PORT: String(port), ...env } });
   child.on('error', () => { /* reported through the log and the wait loop */ });
+  fs.closeSync(fd); // the child keeps its own copy; closing ours lets the log file be deleted on Windows
   const handle = { pid: child.pid, url, log: logFile, cmd };
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
