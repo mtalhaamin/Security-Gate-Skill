@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildPdf, priorityOf } from './report-pdf.mjs';
+import { buildPdf, priorityOf, securityScore } from './report-pdf.mjs';
 import { detectApp, freePort, startApp, stopApp } from './app-start.mjs';
 
 export const TOOLS = ['gitleaks', 'nuget', 'semgrep', 'osv', 'grype', 'trivy', 'zap'];
@@ -149,7 +149,7 @@ export function parseGitleaks(text, label = '', strip = '', readLine = null) {
       if (looksLikeGuidOnly(line)) { id = `${f.RuleID}:guid-like`; severity = 'low'; title = `[GUID-like value, probable false positive] ${title}`; }
     }
     return mk('gitleaks', {
-      id, severity, title,
+      id, severity, title, cwe: [798], // CWE-798: use of hard-coded credentials
       location: `${rel}:${f.StartLine}` + (f.Commit ? ` @${String(f.Commit).slice(0, 8)}` : ''),
       key: f.Fingerprint || `${f.RuleID}|${f.File}|${f.StartLine}|${f.Commit || ''}`, source: label,
     });
@@ -190,13 +190,19 @@ export function parseDotnetList(text) {
   }
   return { findings: dedupe(out), problems: obj.problems || [] };
 }
+// CWE ids from tool metadata: "CWE-89: SQL Injection", ["CWE-79", ...], "693" or 693 -> [89] / [79] / [693]. -1 and 0 mean "none".
+export function cweList(v) {
+  return [...new Set([].concat(v ?? []).map((x) => parseInt(String(x).replace(/^\s*CWE-/i, ''), 10)).filter((n) => Number.isFinite(n) && n > 0))];
+}
 export function parseSemgrep(text) {
   const obj = extractJson(text);
   if (!obj || !Array.isArray(obj.results)) return null;
   return dedupe(obj.results.map((r) => {
     const sev = normSeverity(r.extra?.severity);
+    const md = r.extra?.metadata || {};
     return mk('semgrep', {
-      id: r.check_id, severity: sev || 'medium', severityKnown: !!sev,
+      id: r.check_id, severity: sev || 'medium', severityKnown: !!sev, cwe: cweList(md.cwe),
+      owasp: [].concat(md.owasp || []).map((o) => String(o).match(/A\d{2}:\d{4}/)?.[0]).filter(Boolean),
       title: String(r.extra?.message || '').replace(/\s+/g, ' ').slice(0, 200), // never r.extra.lines (may hold secrets)
       location: `${r.path}:${r.start?.line ?? '?'}`, key: `${r.check_id}|${r.path}|${r.start?.line}`,
     });
@@ -220,9 +226,13 @@ export function parseOsv(text, label = '', strip = '') {
         const name = `${pkg.package?.name}@${pkg.package?.version}`;
         const sp = String(res.source?.path || '');
         const loc = strip && sp.toLowerCase().startsWith(strip.toLowerCase()) ? sp.slice(strip.length) : path.basename(sp);
+        // A NuGet "version" like 10.0.0.0 is the assembly version read from deps.json, not the package version, so it
+        // matches old advisories. Such hits are ranked Low (the reported severity is kept); NuGet Audit checks the real versions.
+        const asmVersion = pkg.package?.ecosystem === 'NuGet' && /^\d+\.\d+\.\d+\.0$/.test(String(pkg.package?.version));
         out.push(mk('osv', {
-          id, severity: sev || 'medium', severityKnown: !!sev, package: name,
-          title: (pkg.package?.ecosystem === 'NuGet' && /^\d+\.\d+\.\d+\.0$/.test(String(pkg.package?.version)) ? '[assembly-version, probable false positive] ' : '') + (v.summary || ''),
+          id, severity: asmVersion ? 'low' : (sev || 'medium'), severityKnown: !!sev || asmVersion, package: name,
+          ...(asmVersion ? { reportedSeverity: sev || 'unknown' } : {}),
+          title: (asmVersion ? `[assembly-version, probable false positive, reported ${sev || 'unknown'}] ` : '') + (v.summary || ''),
           location: `${label}: ${loc}`, key: `${name}|${id}|${label}|${sp}`,
         }));
       }
@@ -289,7 +299,7 @@ export function parseZap(text) {
       const sev = { 3: 'high', 2: 'medium', 1: 'low' }[risk] || 'medium';
       const inst = a.instances || []; const first = inst[0]?.uri || s['@name'] || '';
       out.push(mk('zap', {
-        id: `ZAP-${a.pluginid}`, severity: sev, severityKnown: !!{ 3: 1, 2: 1, 1: 1 }[risk], package: '',
+        id: `ZAP-${a.pluginid}`, severity: sev, severityKnown: !!{ 3: 1, 2: 1, 1: 1 }[risk], package: '', cwe: cweList(a.cweid),
         title: String(a.alert || a.name || '').slice(0, 140), location: `${first}${inst.length > 1 ? ` (+${inst.length - 1} more URLs)` : ''}`,
         solution: String(a.solution || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240),
         key: `${a.pluginid}|${first}|${a.alert}`,
@@ -646,8 +656,11 @@ function writeReports(ctx, results, ev, skipped, ignores, extraNotes) {
   const when = new Date().toISOString();
   const json = { generated: when, failOn: ctx.opts.failOn, verdict: ev.verdict, skipped, notes: extraNotes, invalidSuppressions: ignores.invalid,
     tools: results.map((r) => ({ tool: r.tool, final: r.final, version: r.version, seconds: r.seconds, note: r.note, blocking: r.blocking.length, belowThreshold: r.belowThreshold, suppressed: r.suppressed.length, findings: r.findings, suppressedFindings: r.suppressed })) };
+  json.score = securityScore(json);
   fs.writeFileSync(path.join(ctx.out, 'report.json'), JSON.stringify(json, null, 2));
-  const L = [`# Security gate report`, '', `- Generated: ${when}`, `- Fail threshold: ${ctx.opts.failOn} and above`, `- **Verdict: ${ev.verdict}**`, ''];
+  const sc = json.score;
+  const L = [`# Security gate report`, '', `- Generated: ${when}`, `- Fail threshold: ${ctx.opts.failOn} and above`, `- **Verdict: ${ev.verdict}**`,
+    `- Security grade: **${sc.grade}** (score ${sc.score}/100, ${sc.coverage.ran} of ${sc.coverage.total} checks ran)`, ''];
   L.push('| Tool | Result | Blocking | Below threshold | Suppressed | Notes |', '|---|---|---|---|---|---|');
   for (const r of results) L.push(`| ${r.tool} | ${r.final} | ${r.blocking.length} | ${r.belowThreshold} | ${r.suppressed.length} | ${String(r.note || '').replace(/\|/g, '/')} |`);
   for (const s of skipped) L.push(`| ${s} | SKIPPED | - | - | - | skipped by user, gate is incomplete |`);
@@ -808,7 +821,8 @@ function main() {
     for (const r of results) console.log(`  ${r.tool.padEnd(9)} ${String(r.final).padEnd(12)} blocking=${r.blocking.length} below=${r.belowThreshold} suppressed=${r.suppressed.length}  ${r.note ? '- ' + String(r.note).slice(0, 130) : ''}`);
     for (const s of skipped) console.log(`  ${s.padEnd(9)} SKIPPED      (gate incomplete)`);
     for (const n of extraNotes) console.log(`  note: ${n.slice(0, 200)}`);
-    console.log(`\nVERDICT: ${ev.verdict}   report: ${path.relative(process.cwd(), path.join(out, 'report.md'))}`);
+    const sc = securityScore({ tools: results, skipped });
+    console.log(`\nVERDICT: ${ev.verdict}   grade ${sc.grade} (${sc.score}/100, ${sc.coverage.ran} of ${sc.coverage.total} checks ran)   report: ${path.relative(process.cwd(), path.join(out, 'report.md'))}`);
     if (pdf) console.log(pdf.ok ? `PDF report: ${pdf.file}` : `PDF not created (${pdf.note}) html: ${pdf.file}`);
     return ev.exitCode;
   } finally {

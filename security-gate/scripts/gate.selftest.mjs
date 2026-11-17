@@ -7,9 +7,50 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { detectApp, startApp, freePort } from './app-start.mjs';
+import { securityScore, buildHtml, owaspCategory } from './report-pdf.mjs';
+import { cweList } from './gate.mjs';
 import { parseIgnoredList, trivySkipArgs, looksLikeGuidOnly, semgrepRulesets, detectLanguages, parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
 
 let n = 0; const t = (name, fn) => { fn(); n++; console.log('ok  ' + name); };
+
+t('owasp: findings land in the official OWASP Top 10:2025 category', () => {
+  assert.deepEqual(cweList('CWE-89: Improper Neutralization'), [89]); assert.deepEqual(cweList(['CWE-79', 'CWE-79', '693']), [79, 693]); assert.deepEqual(cweList('-1'), []);
+  assert.equal(owaspCategory({ tool: 'semgrep', cwe: [89] }), 'A05');                         // SQL injection
+  assert.equal(owaspCategory({ tool: 'semgrep', owasp: ['A01:2021'], cwe: [89] }), 'A01');    // the rule's own OWASP tag wins (2021 A01 -> 2025 A01)
+  assert.equal(owaspCategory({ tool: 'semgrep', owasp: ['A03:2021'] }), 'A05');               // 2021 Injection -> 2025 A05
+  assert.equal(owaspCategory({ tool: 'semgrep', owasp: ['A03:2021', 'A05:2025'] }), 'A05');   // a 2025 tag is used as is
+  assert.equal(owaspCategory({ tool: 'gitleaks', id: 'aws-access-token' }), 'A07');          // hard-coded credentials, CWE-798
+  assert.equal(owaspCategory({ tool: 'osv', id: 'CVE-1' }), 'A03');                            // vulnerable library = supply chain
+  assert.equal(owaspCategory({ tool: 'trivy', title: '[misconfiguration] root user' }), 'A02');
+  assert.equal(owaspCategory({ tool: 'zap', cwe: [22] }), 'A01');                              // path traversal
+  assert.equal(owaspCategory({ tool: 'zap', cwe: [] }), null);
+});
+
+t('osv: NuGet assembly versions (x.y.z.0) are ranked Low and keep the reported severity', () => {
+  const j = { results: [{ source: { path: '/pub/Web.deps.json' }, packages: [
+    { package: { name: 'Microsoft.AspNetCore.DataProtection', version: '10.0.0.0', ecosystem: 'NuGet' }, vulnerabilities: [{ id: 'GHSA-9', aliases: ['CVE-2026-1'], summary: 'EoP' }], groups: [{ ids: ['GHSA-9', 'CVE-2026-1'], max_severity: '9.8' }] },
+    { package: { name: 'Real.Pkg', version: '1.2.3', ecosystem: 'NuGet' }, vulnerabilities: [{ id: 'GHSA-8', summary: 'x' }], groups: [{ ids: ['GHSA-8'], max_severity: '7.5' }] }] }] };
+  const [asm, real] = parseOsv(JSON.stringify(j), 'published:Web', '/pub/');
+  assert.equal(asm.severity, 'low'); assert.equal(asm.reportedSeverity, 'critical'); assert.match(asm.title, /probable false positive, reported critical/);
+  assert.equal(real.severity, 'high'); assert.equal(real.reportedSeverity, undefined);
+});
+
+t('score: grade by worst finding, points per distinct issue, capped when a check did not run', () => {
+  const F = (id, severity) => ({ id, severity });
+  const tool = (name, final, findings = []) => ({ tool: name, final, findings });
+  const ex = { tools: [tool('gitleaks', 'FAIL', [F('k', 'critical')]), tool('semgrep', 'FAIL', [F('sqli', 'high'), F('cookie', 'low')]),
+    tool('nuget', 'FAIL', [F('A', 'high'), F('B', 'medium'), F('B', 'medium')]), tool('osv', 'FAIL', [F('C', 'high')]),
+    tool('trivy', 'PASS', [F('DS', 'medium')]), tool('zap', 'PASS', [F('Z1', 'medium'), F('Z2', 'low')]), tool('grype', 'PASS')] };
+  const s = securityScore(ex);
+  assert.equal(s.grade, 'E'); assert.equal(s.score, 34); assert.deepEqual(s.coverage, { ran: 7, total: 7 }); assert.equal(s.complete, true);
+  assert.deepEqual(securityScore({ tools: [tool('gitleaks', 'PASS'), tool('nuget', 'N/A')] }), { grade: 'A', score: 100, coverage: { ran: 1, total: 1 }, complete: true, capped: false, issues: { critical: 0, high: 0, medium: 0, low: 0 } });
+  const lows = securityScore({ tools: [tool('gitleaks', 'PASS', Array.from({ length: 336 }, () => F('guid-like', 'low')).concat([F('x', 'low')]))] });
+  assert.equal(lows.grade, 'B'); assert.equal(lows.score, 98); // 336 hits of one rule are one issue
+  const inc = securityScore({ tools: [tool('gitleaks', 'PASS'), tool('semgrep', 'NOT-RUN')], skipped: ['zap'] });
+  assert.equal(inc.grade, 'C'); assert.equal(inc.capped, true); assert.deepEqual(inc.coverage, { ran: 1, total: 3 });
+  const html = buildHtml({ generated: '2026-11-17T10:00:00Z', failOn: 'high', verdict: 'FAIL', tools: ex.tools.map((x) => ({ ...x, findings: x.findings.map((f) => ({ ...f, tool: x.tool, severityKnown: true, location: 'a.cs:1', package: '', title: f.id })) })) }, 'Demo');
+  assert.ok(html.includes('class="grade"') && html.includes('>E</div>') && html.includes('<b>34</b>') && html.includes('7 of 7 checks ran'));
+});
 
 t('trivy: ignored paths are passed as container paths, which Trivy matches', () => {
   const a = trivySkipArgs({ dirs: ['src/App/umbraco'], files: ['src/App/appsettings.Development.json'] });

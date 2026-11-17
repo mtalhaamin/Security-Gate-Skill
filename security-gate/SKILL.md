@@ -50,7 +50,7 @@ Every scanner runs in its **official Docker image**; nothing is installed on the
    grouped **L0 = High, L1 = Medium, L2 = Low** with the action for each), `report.md`, `report.json` and raw tool output.
    L0 = critical + high severity, L1 = medium (and unknown), L2 = low. Rebuild only the PDF with
    `node <skill-dir>/scripts/report-pdf.mjs <out>/report.json [out.pdf]`.
-   **Read** `<out>/report.md` and answer in at most ~15 lines: verdict, one line per tool, the top blocking findings (id, package or
+   **Read** `<out>/report.md` and answer in at most ~15 lines: verdict and security grade (A-E, score /100), one line per tool, the top blocking findings (id, package or
    file:line, fixed version if known), and what the user must do themself (rotate leaked credentials, approve downloads).
 4. **Fix loop** when asked to fix: see "Fixing" below, then re-run the gate until PASS. Report any remaining finding honestly instead of
    suppressing it.
@@ -64,6 +64,15 @@ Every scanner runs in its **official Docker image**; nothing is installed on the
 | INCOMPLETE | 2 | A tool could not run (Docker down, image missing, error), found nothing to scan (`NO-COVERAGE`), or was skipped with `--skip` |
 
 `N/A` (NuGet on a non-.NET repo) does not block. Unknown severity from a tool is treated as `medium` and marked `?`.
+
+The report also gives a **security grade A-E** (SonarQube's rule: E any critical, D any high, C any medium, B only low, A none; capped
+at C when a check did not run) and a **score 0-100** (100 minus 25 per critical issue, 10 per high up to 60, 3 per medium up to 30,
+1 per low up to 10). The grade never changes the verdict; the verdict still comes only from `--fail-on`.
+
+Every finding is mapped to an **OWASP Top 10:2025** category (official CWE lists in `references/owasp-top10-2025.json`;
+vulnerable libraries count as A03, IaC settings as A02, leaked secrets as A07 via CWE-798). The PDF has a coverage table for
+all 10 categories. Never claim the project "passes the OWASP Top 10": A06 Insecure Design and A09 Logging need a manual review,
+and A01 Broken Access Control is only partly covered by scanners.
 
 ## Fixing (by tool)
 
