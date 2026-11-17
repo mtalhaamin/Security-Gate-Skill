@@ -3,7 +3,7 @@
 // NOTE: fixtures follow the documented output of each tool. They prove the gate logic, not that a
 // given scanner version still prints exactly this shape; the first real run of each tool confirms that.
 import assert from 'node:assert/strict';
-import { parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
+import { parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
 
 let n = 0; const t = (name, fn) => { fn(); n++; console.log('ok  ' + name); };
 
@@ -63,6 +63,50 @@ t('verdict: PASS only when everything ran and is clean', () => {
   assert.equal(evaluate([ok('a')], 'high', ['semgrep']).verdict, 'INCOMPLETE');
   assert.equal(evaluate([ok('a', [f('high')]), { tool: 'b', status: 'ERROR', findings: [] }], 'high').verdict, 'FAIL');
   assert.equal(evaluate([ok('a', [f('medium')])], 'medium').exitCode, 1);
+});
+
+t('trivy: vulnerabilities + misconfigurations, empty results', () => {
+  const j = { Results: [{ Target: 'web.deps.json', Vulnerabilities: [{ VulnerabilityID: 'CVE-1', PkgName: 'Foo', InstalledVersion: '1.0', FixedVersion: '1.1, 2.0', Severity: 'HIGH', Title: 'bad' }] },
+    { Target: 'Dockerfile', Misconfigurations: [{ ID: 'DS002', Title: 'root user', Severity: 'MEDIUM', CauseMetadata: { StartLine: 3 } }] }] };
+  const f = parseTrivy(JSON.stringify(j), 'repo');
+  assert.equal(f.length, 2); assert.equal(f[0].severity, 'high'); assert.equal(f[0].fixed, '1.1'); assert.equal(f[1].location, 'repo: Dockerfile:3'); assert.ok(f[1].title.includes('misconfiguration'));
+  assert.deepEqual(parseTrivy('{"SchemaVersion":2}', 'x'), []); assert.equal(parseTrivy('nope', 'x'), null);
+});
+
+t('zap: risk codes mapped, informational skipped', () => {
+  const j = { site: [{ '@name': 'http://localhost:8080', alerts: [
+    { pluginid: '10202', alert: 'Missing Anti-CSRF Tokens', riskcode: '2', instances: [{ uri: 'http://localhost:8080/a' }, { uri: 'http://localhost:8080/b' }], solution: '<p>Use tokens</p>' },
+    { pluginid: '10096', alert: 'Timestamp Disclosure', riskcode: '1', instances: [] }, { pluginid: '1', alert: 'Info', riskcode: '0', instances: [] }] }] };
+  const f = parseZap(JSON.stringify(j));
+  assert.equal(f.length, 2); assert.equal(f[0].severity, 'medium'); assert.equal(f[0].id, 'ZAP-10202'); assert.ok(f[0].location.includes('+1 more')); assert.equal(f[0].solution, 'Use tokens'); assert.equal(f[1].severity, 'low');
+});
+
+t('DAST target safety: local only unless the host is named', () => {
+  assert.equal(checkDastTarget('http://localhost:5000/x').ok, true);
+  assert.equal(checkDastTarget('http://localhost:5000/x').containerUrl, 'http://host.docker.internal:5000/x');
+  assert.equal(checkDastTarget('https://app.test').ok, true);
+  const bad = checkDastTarget('https://example.com'); assert.equal(bad.ok, false); assert.ok(bad.reason.includes('--dast-allow-host'));
+  assert.equal(checkDastTarget('https://example.com', ['example.com']).ok, true);
+  assert.equal(checkDastTarget('ftp://localhost').ok, false); assert.equal(checkDastTarget('not a url').ok, false);
+});
+
+t('docker runtime choice: pull by default, --no-pull refuses, down engine reported', () => {
+  assert.equal(chooseRuntime({ dockerUp: true, imageLocal: true, noPull: false }), 'docker');
+  assert.equal(chooseRuntime({ dockerUp: true, imageLocal: false, noPull: false }), 'docker');
+  assert.equal(chooseRuntime({ dockerUp: true, imageLocal: false, noPull: true }), 'pull-needed');
+  assert.equal(chooseRuntime({ dockerUp: true, imageLocal: true, noPull: true }), 'docker');
+  assert.equal(chooseRuntime({ dockerUp: false, imageLocal: false, noPull: false }), 'docker-down');
+});
+
+t('tool selection: groups like the team scan.ps1, zap only with a target', () => {
+  assert.deepEqual(selectTools({ tool: ['all'] }), ['gitleaks', 'nuget', 'semgrep', 'osv', 'grype', 'trivy']);
+  assert.deepEqual(selectTools({ tool: ['sca'] }), ['nuget', 'osv']);
+  assert.deepEqual(selectTools({ tool: ['sast'] }), ['semgrep']);
+  assert.deepEqual(selectTools({ tool: ['secrets'] }), ['gitleaks']);
+  assert.deepEqual(selectTools({ tool: ['container'] }), ['grype', 'trivy']);
+  assert.deepEqual(selectTools({ tool: ['all'], dast: true }), ['gitleaks', 'nuget', 'semgrep', 'osv', 'grype', 'trivy', 'zap']);
+  assert.deepEqual(selectTools({ tool: ['all'], skip: ['semgrep'] }), ['gitleaks', 'nuget', 'osv', 'grype', 'trivy']);
+  assert.deepEqual(selectTools({ tool: ['all'], only: ['trivy', 'osv'] }), ['osv', 'trivy']);
 });
 
 console.log(`\n${n} checks passed`);

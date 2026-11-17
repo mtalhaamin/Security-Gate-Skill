@@ -17,7 +17,6 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.join(HERE, 'security-gate');
-const TOOLS = path.join(HERE, 'tools');
 const PROJECT = { claude: ['.claude', 'skills'], cursor: ['.cursor', 'skills'], codex: ['.agents', 'skills'], antigravity: ['.agents', 'skills'] };
 const GLOBAL = { claude: ['.claude', 'skills'], cursor: ['.cursor', 'skills'], codex: ['.agents', 'skills'], antigravity: ['.gemini', 'antigravity', 'skills'] };
 const MARK_START = '<!-- security-gate:start -->'; const MARK_END = '<!-- security-gate:end -->';
@@ -43,8 +42,8 @@ function agentsMdBlock(rel) {
 
 When asked to run the security gate, scan this repository for secrets or vulnerabilities, or check it is clean before a commit, PR or release, use the \`security-gate\` skill at \`${rel}/security-gate/SKILL.md\` (follow it exactly). In short:
 
-1. \`node ${rel}/security-gate/scripts/gate.mjs --preflight\` lists missing tools. Never install anything without the user's explicit yes.
-2. \`node ${rel}/security-gate/scripts/gate.mjs --root .\` runs gitleaks, NuGet audit, semgrep, osv-scanner and grype and writes \`.work/security-gate/security-report.pdf\` (findings ranked L0 High, L1 Medium, L2 Low).
+1. Tell the user once that the first run pulls official Docker images (about 0.6 GB, plus 1.1 GB for ZAP if DAST is used) and wait for their yes. Needs Docker Desktop and the .NET SDK.
+2. \`node ${rel}/security-gate/scripts/gate.mjs --root .\` runs OSV-Scanner + NuGet Audit, Semgrep, gitleaks, Trivy + Grype (add \`--dast-url http://localhost:PORT\` for OWASP ZAP, local targets only) and writes \`.work/security-gate/security-report.pdf\` (findings ranked L0 High, L1 Medium, L2 Low).
 3. Exit code 0 = PASS, 1 = FAIL, 2 = INCOMPLETE. Never call the repo clean unless the verdict is PASS. Never print secret values.
 ${MARK_END}
 `;
@@ -61,7 +60,6 @@ function main() {
   if (!o.global && !fs.existsSync(base)) { console.error(`project folder not found: ${base}`); return 2; }
   const map = o.global ? GLOBAL : PROJECT;
   const dests = [...new Set(o.agents.map((a) => path.join(base, ...map[a])))];
-  const hasTools = fs.existsSync(path.join(TOOLS, 'bin'));
   for (const root of dests) {
     const dest = path.join(root, 'security-gate');
     if (fs.existsSync(dest) && !o.force) { console.log(`skip   ${dest} (exists; use --force to replace)`); continue; }
@@ -70,7 +68,6 @@ function main() {
     if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true });
     fs.mkdirSync(root, { recursive: true });
     fs.cpSync(SRC, dest, { recursive: true });
-    if (hasTools) fs.writeFileSync(path.join(dest, 'tools.path'), TOOLS); // gate.mjs finds the scanners installed in this repo
   }
   if (o.agentsMd && !o.global) {
     const first = dests.find((d) => d.includes(`${path.sep}.agents${path.sep}`)) || dests[0];
@@ -82,7 +79,7 @@ function main() {
     console.log(`${o.dry ? 'would update' : 'update'} ${f}`);
     if (!o.dry) fs.writeFileSync(f, t);
   }
-  console.log(hasTools ? `Scanners: using ${TOOLS}` : 'Scanners not installed yet: run  powershell -ExecutionPolicy Bypass -File .\\install-tools.ps1  (or install them on PATH).');
+  console.log('Needs Docker Desktop and the .NET SDK. The first gate run pulls the official scanner images (sizes are printed).');
   console.log('Restart the agent so it picks up the new skill.');
   return 0;
 }
