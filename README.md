@@ -111,4 +111,6 @@ More help, all options, and safety notes: **[docs/ADVANCED.md](docs/ADVANCED.md)
 - Your project is mounted read-only inside Docker, and secret values are never written to the report.
 - Tested on Windows. It should also work on Linux and macOS but that is untested.
 
+Want to help? See [CONTRIBUTING.md](CONTRIBUTING.md). Found a security problem in this project? See [SECURITY.md](SECURITY.md).
+
 License: [MIT](LICENSE)
