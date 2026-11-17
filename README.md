@@ -1,5 +1,9 @@
 # Security Gate Skill
 
+[![Self-test](https://github.com/mtalhaamin/Security-Gate-Skill/actions/workflows/selftest.yml/badge.svg)](https://github.com/mtalhaamin/Security-Gate-Skill/actions/workflows/selftest.yml)
+[![License: MIT](https://img.shields.io/github/license/mtalhaamin/Security-Gate-Skill)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/mtalhaamin/Security-Gate-Skill)](https://github.com/mtalhaamin/Security-Gate-Skill/releases)
+
 **One command that scans your project for security problems and gives you a PDF report.**
 
 ![Example report](docs/example-report.png)
