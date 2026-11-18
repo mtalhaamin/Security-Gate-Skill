@@ -42,7 +42,7 @@ Every scanner runs in its **official Docker image**; nothing is installed on the
    - Default `--tool all` = **sca** (NuGet Audit + OSV-Scanner), **sast** (Semgrep), **secrets** (gitleaks), **container** (Trivy + Grype
      on the source tree and, for .NET, the published output). Pick groups with `--tool sca|sast|secrets|container|dast[,..]`.
    - **Image scan**: `--image myapp:tag` (repeatable). A local image is scanned through the Docker socket, otherwise from the registry.
-   - **DAST**: start the app locally, then `--dast-url http://localhost:PORT` (adds ZAP; `--tool dast` runs only ZAP). Or let the gate start it: `--dast-auto` (ASP.NET Core, Node.js, Django; it finds the start command, picks a free port, stops the app afterwards) or `--dast-start "<command with {port}>"` for any other stack. Both run the project's own code, so **ask the user first**.
+   - **DAST**: start the app locally, then `--dast-url http://localhost:PORT` (adds ZAP; `--tool dast` runs only ZAP). Or let the gate start it: `--dast-auto --i-trust-this-repo` (ASP.NET Core, Node.js, Django; it finds the start command, picks a free port, runs it without a shell, stops the app afterwards) or `--dast-start "<command with {port}>"` for any other stack. Both run the project's own code, so **ask the user first** and pass `--i-trust-this-repo` only after they agree.
    - The first run is slow (image pulls, Semgrep rules, Trivy/Grype databases); run it in the background if it may exceed 2 minutes.
    - Other flags: `--fail-on critical|high|medium|low` (default high), `--skip a,b` (makes the gate INCOMPLETE), `--no-history`,
      `--no-publish`, `--semgrep-config p/<ruleset>` (replaces the automatic rules) or `--semgrep-extra p/<ruleset>` (adds to them), `--no-pdf`, `--keep`.

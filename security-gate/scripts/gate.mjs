@@ -338,6 +338,17 @@ export function selectTools({ tool = ['all'], only = [], skip = [], dast = false
 }
 
 // ------------------------------------------------------------------ suppressions + verdict (pure)
+// Suppressions match exactly, never by substring: "foo" must not hide "foobar", and "src/a" must not hide "src/abc".
+// package: "name" (any version) or "name@version". path: a file ("src/a.cs", any line), "src/a.cs:12", or a folder
+// ending in "/" ("uSync/"). A "label: " prefix in the location (e.g. "published:Web: Web.deps.json") is ignored.
+const pkgName = (p) => { const s = String(p || ''); const i = s.lastIndexOf('@'); return i > 0 ? s.slice(0, i) : s; };
+export function packageMatches(want, pkg) { return !want || String(pkg || '') === want || pkgName(pkg) === want; }
+export function pathMatches(want, location) {
+  if (!want) return true;
+  const loc = String(location || '').replace(/^\S+: /, '');
+  if (want.endsWith('/')) return loc.startsWith(want);
+  return loc === want || loc.startsWith(`${want}:`) || loc.startsWith(`${want} `);
+}
 export function applyIgnores(findings, entries, now = new Date()) {
   const invalid = []; const valid = [];
   for (const e of entries || []) {
@@ -349,7 +360,7 @@ export function applyIgnores(findings, entries, now = new Date()) {
   const active = []; const suppressed = [];
   for (const f of findings) {
     const hit = valid.find((e) => (!e.tool || e.tool === '*' || e.tool === f.tool) && e.id === f.id
-      && (!e.package || f.package.includes(e.package)) && (!e.path || f.location.includes(e.path)));
+      && packageMatches(e.package, f.package) && pathMatches(e.path, f.location));
     (hit ? suppressed : active).push(hit ? { ...f, suppressedBy: hit.reason, until: hit.expires } : f);
   }
   return { active, suppressed, invalid };
@@ -359,7 +370,8 @@ export function evaluate(results, failOn, skipped = []) {
   for (const r of results) {
     r.blocking = r.findings.filter((f) => SEV[f.severity] >= th);
     r.belowThreshold = r.findings.length - r.blocking.length;
-    r.final = r.status === 'OK' ? (r.blocking.length ? 'FAIL' : 'PASS') : r.status;
+    // PARTIAL = the tool ran but did not cover everything: blocking findings still fail the gate, otherwise it is not a PASS.
+    r.final = r.status === 'OK' ? (r.blocking.length ? 'FAIL' : 'PASS') : r.status === 'PARTIAL' && r.blocking.length ? 'FAIL' : r.status;
   }
   const failed = results.some((r) => r.final === 'FAIL');
   const incomplete = results.some((r) => !['PASS', 'FAIL', 'N/A'].includes(r.final)) || skipped.length > 0;
@@ -438,9 +450,28 @@ export function parseIgnoredList(stdout) {
 function gitIgnored(ctx) {
   if (ctx._ignored) return ctx._ignored;
   const r = run('git', ['-c', 'core.quotepath=off', 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory'], { cwd: ctx.root });
-  return (ctx._ignored = r.status === 0 ? parseIgnoredList(r.stdout) : { dirs: [], files: [] });
+  const ig = r.status === 0 ? parseIgnoredList(r.stdout) : { dirs: [], files: [] };
+  // The report folder is never scanned, even outside a git repository (its raw tool outputs must not feed the next run).
+  const outRel = path.relative(ctx.root, ctx.out).split(path.sep).join('/');
+  if (outRel && !outRel.startsWith('..') && !path.isAbsolute(outRel) && !ig.dirs.some((d) => outRel === d || outRel.startsWith(`${d}/`))) ig.dirs.unshift(outRel);
+  const total = ig.dirs.length + ig.files.length;
+  if (total > IGNORED_CAP) ctx.notes.push(`Only the first ${IGNORED_CAP} of ${total} gitignored paths were passed to Semgrep, Grype and Trivy; the rest may be scanned (gitleaks gets all of them).`);
+  return (ctx._ignored = ig);
 }
 const IGNORED_CAP = 300; // keeps the docker command line short; the rest is still covered by the fixed folder list
+
+// Raw tool outputs are kept next to the report for debugging, but the parts that can hold a secret value or matched
+// source text are removed first (report.json / report.md / the PDF never contain them anyway).
+export function redactRaw(kind, obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (kind === 'trivy') for (const res of obj.Results || []) for (const s of res.Secrets || []) { s.Match = '[redacted]'; delete s.Code; }
+  if (kind === 'semgrep') for (const r of obj.results || []) if (r.extra) { r.extra.lines = '[redacted]'; delete r.extra.metavars; delete r.extra.dataflow_trace; }
+  if (kind === 'zap') for (const s of obj.site || []) for (const a of s.alerts || []) for (const i of a.instances || []) { if (i.evidence) i.evidence = '[redacted]'; if (i.otherinfo) i.otherinfo = '[redacted]'; }
+  return obj;
+}
+function redactFile(file, kind) {
+  try { const obj = extractJson(fs.readFileSync(file, 'utf8')); if (obj) fs.writeFileSync(file, JSON.stringify(redactRaw(kind, obj))); } catch { /* nothing to redact */ }
+}
 function gitleaksConfig(ctx) {
   for (const f of ['.gitleaks.toml', 'gitleaks.toml']) {
     if (fs.existsSync(path.join(ctx.root, f))) return { arg: `${DP.root}/${f}`, note: `using project config ${f}` };
@@ -451,7 +482,7 @@ function gitleaksConfig(ctx) {
   const sep = '[\\\\/]'; // regex class: backslash or slash
   const paths = [...ig.dirs, ...ig.files]
     .map((p) => `(^|${sep})${esc(p).replace(/\//g, sep)}(${sep}|$)`);
-  paths.push(`(^|${sep})(node_modules|bin|obj|\\.git)${sep}`);
+  paths.push(`(^|${sep})(node_modules|bin|obj|\\.git|\\.work)${sep}`);
   fs.writeFileSync(path.join(ctx.out, 'gitleaks.config.toml'), `[extend]\nuseDefault = true\n\n[[allowlists]]\ndescription = "gitignored and generated paths"\npaths = [\n${paths.map((p) => `  '''${p}'''`).join(',\n')}\n]\n`);
   return { arg: `${DP.out}/gitleaks.config.toml`, note: `${paths.length} ignored paths allow-listed` };
 }
@@ -510,9 +541,25 @@ function runSemgrep(ctx) {
   const r = toolExec(ctx, 'semgrep', args, { timeout: 30 * 60 * 1000, workdir: DP.root });
   let text = ''; try { text = fs.readFileSync(report, 'utf8'); } catch { /* none */ }
   const findings = r.status !== null && r.status < 2 ? parseSemgrep(text) : null;
+  redactFile(report, 'semgrep');
   if (!findings) return { status: 'ERROR', findings: [], note: `semgrep failed (exit ${r.status}): ${tail(r.stderr || r.stdout)}` };
-  const errs = (extractJson(text)?.errors || []).length;
-  return { status: 'OK', findings, note: `rulesets: ${configs.join(', ')}${errs ? `; ${errs} files/rules had scan errors (see semgrep.json)` : ''}` };
+  const cov = semgrepCoverage(extractJson(text), findings);
+  return { status: cov.status, findings, note: `rulesets: ${configs.join(', ')}; ${cov.note}` };
+}
+// Semgrep exits 0 even when rules fail to load or files cannot be parsed; it lists those in errors[]. A scan is only
+// trusted ("OK") when no rule/config error happened and at least most of the scanned files were read cleanly.
+// ERROR / PARTIAL are not PASS, so evaluate() turns them into INCOMPLETE (PARTIAL with blocking findings still FAILs).
+export function semgrepCoverage(obj, findings = []) {
+  const errors = Array.isArray(obj?.errors) ? obj.errors : [];
+  const fatal = errors.filter((e) => String(e.level || '').toLowerCase() === 'error' || !e.path);
+  const badFiles = new Set(errors.filter((e) => e.path && !fatal.includes(e)).map((e) => e.path));
+  const scanned = Array.isArray(obj?.paths?.scanned) ? obj.paths.scanned.length : null;
+  const share = scanned ? badFiles.size / scanned : 1;
+  const notRun = (why) => ({ status: findings.length ? 'PARTIAL' : 'ERROR', note: why });
+  if (fatal.length) return notRun(`${fatal.length} rule/config error(s): semgrep did not run all rules (see semgrep.json)`);
+  if (scanned === 0) return notRun('semgrep scanned no files');
+  if (badFiles.size && (scanned === null || share > 0.2)) return notRun(`${badFiles.size} of ${scanned ?? '?'} files could not be parsed: coverage is partial`);
+  return { status: 'OK', note: `${scanned ?? '?'} files scanned${badFiles.size ? `, ${badFiles.size} could not be parsed (see semgrep.json)` : ''}` };
 }
 // OSV-Scanner is pointed at each top-level project folder (not the repo root) so dot-folders such as .claude, .git
 // and .work (tooling, not product code) are never scanned; the same folders semgrep, grype and trivy exclude.
@@ -592,6 +639,7 @@ function runTrivy(ctx) {
     if (r.status !== 0) return { status: 'ERROR', findings: [], note: `trivy failed on ${t.label} (exit ${r.status}): ${tail(r.stderr || r.stdout)}` };
     let text = ''; try { text = fs.readFileSync(report, 'utf8'); } catch { /* none */ }
     const f = parseTrivy(text, t.label);
+    redactFile(report, 'trivy');
     if (!f) return { status: 'ERROR', findings: [], note: `trivy output for ${t.label} was not valid JSON` };
     findings.push(...f);
   }
@@ -602,19 +650,22 @@ function runZap(ctx) {
   const o = ctx.opts;
   if (!(o.dastAuto || o.dastStart)) return runZapOn(ctx, o.dastUrl);
   // The gate starts the project's own app on a free local port, scans it, and always stops it again.
-  let command = o.dastStart; let cwd = ctx.root; let how = 'your --dast-start command';
-  if (!command) {
+  // --dast-start: the user's own command line (shell). --dast-auto: a detected command run without a shell.
+  let launch = { command: o.dastStart }; let cwd = ctx.root; let how = 'your --dast-start command';
+  if (!o.dastStart) {
     const app = detectApp(ctx.root);
     if (!app) return { status: 'ERROR', findings: [], note: 'could not tell how to start this project (supported: ASP.NET Core, Node.js, Django). Start it yourself and use --dast-url, or give --dast-start "<command with {port}>"' };
     if (app.problems.length) return { status: 'ERROR', findings: [], note: `${app.label}: ${app.problems.join('; ')}` };
-    command = app.cmd; cwd = app.cwd; how = app.label + (app.others ? ` (${app.others} other app(s) found; use --dast-start to pick another)` : '');
+    launch = { file: app.file, args: app.args, needsShell: !!app.needsShell }; cwd = app.cwd;
+    how = app.label + (app.others ? ` (${app.others} other app(s) found; use --dast-start to pick another)` : '');
+    launch.display = app.cmd;
   }
   let port = 0;
   if (o.dastUrl) { try { port = parseInt(new URL(o.dastUrl).port, 10) || 0; } catch { /* ignore */ } }
   if (!port) port = freePort();
   if (!port) return { status: 'ERROR', findings: [], note: 'could not find a free local port' };
-  console.log(`  starting the app: ${command.replace(/\{port\}/g, String(port))}   [${how}]`);
-  const app = startApp({ command, cwd, port, logFile: path.join(ctx.out, 'dast-app.log') });
+  console.log(`  starting the app: ${(launch.display || launch.command).replace(/\{port\}/g, String(port))}   [${how}]`);
+  const app = startApp({ ...launch, cwd, port, logFile: path.join(ctx.out, 'dast-app.log') });
   if (!app.ok) return { status: 'ERROR', findings: [], note: app.note };
   try {
     const r = runZapOn(ctx, app.url);
@@ -633,6 +684,9 @@ function runZapOn(ctx, dastUrl) {
   const r = run('docker', a, { timeout: 60 * 60 * 1000 });
   let text = ''; try { text = fs.readFileSync(report, 'utf8'); } catch { /* none */ }
   const findings = r.status !== null && r.status <= 2 ? parseZap(text) : null;
+  redactFile(report, 'zap');
+  // zap.html holds the alerts with their evidence; keep it only when asked (--keep-raw).
+  if (!o.keepRaw) { try { fs.rmSync(path.join(ctx.out, 'zap.html'), { force: true }); } catch { /* ignore */ } }
   if (!findings) return { status: 'ERROR', findings: [], note: `zap failed (exit ${r.status}); is ${o.dastUrl} up? ${tail(r.stderr || r.stdout)}` };
   return { status: 'OK', findings: dedupe(findings), note: `${o.dastFull ? 'ACTIVE full scan' : 'passive baseline scan'} of ${o.dastUrl} (${o.dastMinutes} min spider)` };
 }
@@ -682,7 +736,7 @@ function writeReports(ctx, results, ev, skipped, ignores, extraNotes) {
 // ------------------------------------------------------------------ main
 function parseArgs(argv) {
   const o = { root: process.cwd(), out: '', failOn: 'high', tool: ['all'], only: [], skip: [], ignore: '', semgrepConfigs: [], semgrepExtra: [], excludes: [], images: [], dastUrl: '', dastAuto: false, dastStart: '', dastAllow: [], dastFull: false, dastConfirm: false, dastMinutes: 1,
-    noPull: false, preflight: false, noPublish: false, keep: false, noHistory: false, noPdf: false, help: false };
+    noPull: false, preflight: false, noPublish: false, keep: false, keepRaw: false, trustRepo: false, noHistory: false, noPdf: false, help: false };
   const val = (i) => { if (i + 1 >= argv.length) throw new Error(`${argv[i]} needs a value`); return argv[i + 1]; };
   const list = (s) => s.split(',').map((x) => x.trim()).filter(Boolean);
   for (let i = 0; i < argv.length; i++) {
@@ -699,7 +753,8 @@ function parseArgs(argv) {
     else if (a === '--dast-minutes') o.dastMinutes = Math.max(1, parseInt(val(i++), 10) || 1);
     else if (a === '--no-pull') o.noPull = true;
     else if (a === '--preflight') o.preflight = true; else if (a === '--no-publish') o.noPublish = true;
-    else if (a === '--keep') o.keep = true; else if (a === '--no-history') o.noHistory = true; else if (a === '--no-pdf') o.noPdf = true;
+    else if (a === '--keep') o.keep = true; else if (a === '--keep-raw') o.keepRaw = true; else if (a === '--i-trust-this-repo') o.trustRepo = true;
+    else if (a === '--no-history') o.noHistory = true; else if (a === '--no-pdf') o.noPdf = true;
     else if (a === '--help' || a === '-h') o.help = true; else throw new Error(`unknown argument ${a}`);
   }
   if (!SEV[o.failOn]) throw new Error('--fail-on must be critical, high, medium or low');
@@ -707,6 +762,7 @@ function parseArgs(argv) {
   for (const g of o.tool) if (g !== 'all' && !GROUPS[g]) throw new Error(`unknown --tool "${g}" (valid: all, ${Object.keys(GROUPS).join(', ')})`);
   if ((o.tool.includes('dast') || o.only.includes('zap')) && !o.dastUrl && !o.dastAuto && !o.dastStart) throw new Error('DAST needs --dast-url <http://localhost:PORT> (the app must be running) or --dast-auto (the gate starts the app itself)');
   if (o.dastStart && !/\{port\}/.test(o.dastStart) && !o.dastUrl) throw new Error('--dast-start needs {port} in the command (or a --dast-url with the port the app will use)');
+  if (o.dastAuto && !o.dastStart && !o.trustRepo) throw new Error('--dast-auto runs the project\'s own code on this computer; add --i-trust-this-repo only for code you trust');
   if (o.dastFull && !o.dastConfirm) throw new Error('--dast-full sends ACTIVE attack traffic; add --i-am-authorized only if you own or are authorised to test the target');
   return o;
 }
@@ -715,10 +771,11 @@ const HELP = `security-gate (Docker-first): sca + sast + secrets + container (+ 
                 [--tool all|sca|sast|secrets|container|dast[,..]]  [--only a,b] [--skip a,b]
                 [--image <ref>]...                       scan a container image (local image via the Docker socket)
                 [--dast-url <url> | --dast-auto | --dast-start "<cmd with {port}>"]   scan a running app with OWASP ZAP (local only)
-                    --dast-auto   the gate finds how to start the app (ASP.NET Core, Node.js, Django), starts it, scans it, stops it
+                    --dast-auto --i-trust-this-repo   the gate starts the app (ASP.NET Core, Node.js, Django), scans it, stops it
+                                  (it runs the project's own code, hence the extra flag)
                 [--dast-full --i-am-authorized] [--dast-allow-host <h>] [--dast-minutes n]
                 [--preflight] [--no-pull] [--no-publish] [--no-history] [--no-pdf]
-                [--ignore <file>] [--semgrep-config <cfg>]... [--semgrep-extra <cfg>]... [--exclude <glob>]... [--keep]
+                [--ignore <file>] [--semgrep-config <cfg>]... [--semgrep-extra <cfg>]... [--exclude <glob>]... [--keep] [--keep-raw]
   groups: sca = nuget + osv, sast = semgrep, secrets = gitleaks, container = trivy + grype, dast = zap
   needs : Docker Desktop (started automatically on Windows), .NET SDK (for nuget), Node 20+
   images: pulled on first use (sizes printed; --no-pull forbids it); versions pinned, override with SECURITY_GATE_IMAGE_<TOOL>
@@ -759,8 +816,10 @@ function main() {
   if (opts.preflight) {
     console.log('Preflight (nothing is pulled or installed by --preflight):');
     console.log(`  docker    ${dVer ? 'OK       engine ' + dVer : 'NOT RUNNING  (it is started automatically on a real run on Windows)'}`);
-    console.log(`  dotnet    ${dotnetVersion ? 'OK       SDK ' + dotnetVersion : 'MISSING  -> install the .NET SDK 8+ (needed for NuGet Audit and publish)'}`);
-    let problems = dotnetVersion ? 0 : 1;
+    // The .NET SDK is only needed when the project has .NET code (the real run reports NuGet as N/A otherwise).
+    const needsDotnet = findDotnetTargets(root).targets.length > 0;
+    console.log(`  dotnet    ${dotnetVersion ? 'OK       SDK ' + dotnetVersion : needsDotnet ? 'MISSING  -> install the .NET SDK 8+ (needed for NuGet Audit and publish)' : 'not needed (no .sln/.slnx/.csproj found)'}`);
+    let problems = dotnetVersion || !needsDotnet ? 0 : 1;
     for (const t of ['gitleaks', 'semgrep', 'osv', 'grype', 'trivy', 'zap']) {
       const local = dVer && imageLocal(imageOf(t));
       console.log(`  ${t.padEnd(9)} ${local ? 'OK       image ready ' + imageOf(t) : `will pull ${imageOf(t)} (~${IMAGES[t].mb ?? '?'} MB) on first use${t === 'zap' ? ' (only for --dast-url / --dast-auto)' : ''}`}`);
@@ -771,9 +830,11 @@ function main() {
   }
 
   fs.mkdirSync(out, { recursive: true }); // created only for a real run (preflight writes nothing)
+  // A report folder inside the project gets its own .gitignore, so `git add -A` never commits scan output.
+  if (!path.relative(root, out).startsWith('..')) { try { fs.writeFileSync(path.join(out, '.gitignore'), '# Security Gate scan output: never commit\n*\n'); } catch { /* read-only: ignore */ } }
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'security-gate-'));
-  const ctx = { root, out, tmp, opts, rt, dotnet: findDotnetTargets(root), dotnetVersion, pub: [] };
   const extraNotes = [];
+  const ctx = { root, out, tmp, opts, rt, dotnet: findDotnetTargets(root), dotnetVersion, pub: [], notes: extraNotes };
   if (outOfScope.length) extraNotes.push(`Partial scan by request: ${outOfScope.join(', ')} not run. This verdict covers only: ${selected.join(', ')}.`);
   try {
     // pull / inspect the images that will be used

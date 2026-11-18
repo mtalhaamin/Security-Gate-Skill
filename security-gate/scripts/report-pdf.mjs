@@ -89,7 +89,7 @@ function fontFaces() {
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const STATUS = {
   PASS: ['Passed', 'ok'], FAIL: ['Blocking findings', 'bad'], 'NOT-RUN': ['Not run', 'warn'], ERROR: ['Tool error', 'warn'],
-  'NO-COVERAGE': ['Nothing to scan', 'warn'], 'N/A': ['Not applicable', 'mut'],
+  'NO-COVERAGE': ['Nothing to scan', 'warn'], 'N/A': ['Not applicable', 'mut'], PARTIAL: ['Partial scan', 'warn'],
 };
 const TOOL_LABEL = { gitleaks: 'gitleaks', nuget: 'NuGet Audit', semgrep: 'Semgrep', osv: 'OSV-Scanner', grype: 'Grype', trivy: 'Trivy', zap: 'OWASP ZAP' };
 const CATEGORY = { gitleaks: 'Credential leaks', nuget: 'Software composition (SCA)', osv: 'Software composition (SCA)', semgrep: 'Static analysis (SAST)', trivy: 'Containers, IaC and dependencies', grype: 'Containers, IaC and dependencies', zap: 'Dynamic analysis (DAST)' };
@@ -190,7 +190,7 @@ export function buildHtml(rep, project) {
   const naT = rep.tools.filter((t) => t.final === 'N/A');
   const missT = rep.tools.filter((t) => !['PASS', 'FAIL', 'N/A'].includes(t.final));
   const toolsLine = `<b>Checked with:</b> ${ranT.map(lbl).join(', ') || 'none'}`
-    + (missT.length || (rep.skipped || []).length ? ` &nbsp;&middot;&nbsp; <span class="no">Did not run:</span> ${[...missT.map(lbl), ...(rep.skipped || []).map((s) => esc(TOOL_LABEL[s] || s))].join(', ')}` : '')
+    + (missT.length || (rep.skipped || []).length ? ` &nbsp;&middot;&nbsp; <span class="no">Did not run fully:</span> ${[...missT.map(lbl), ...(rep.skipped || []).map((s) => esc(TOOL_LABEL[s] || s))].join(', ')}` : '')
     + (naT.length ? ` &nbsp;&middot;&nbsp; Not applicable: ${naT.map(lbl).join(', ')}` : '')
     + (!rep.tools.some((t) => t.tool === 'zap') && !(rep.skipped || []).includes('zap') ? ' &nbsp;&middot;&nbsp; Not included: OWASP ZAP (running website; add <code>--dast-auto</code>)' : '');
 

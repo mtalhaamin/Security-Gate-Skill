@@ -8,10 +8,44 @@ import os from 'node:os';
 import path from 'node:path';
 import { detectApp, startApp, freePort } from './app-start.mjs';
 import { securityScore, buildHtml, owaspCategory } from './report-pdf.mjs';
-import { cweList } from './gate.mjs';
+import { cweList, semgrepCoverage, redactRaw, packageMatches, pathMatches } from './gate.mjs';
 import { parseIgnoredList, trivySkipArgs, looksLikeGuidOnly, semgrepRulesets, detectLanguages, parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
 
 let n = 0; const t = (name, fn) => { fn(); n++; console.log('ok  ' + name); };
+
+t('semgrep: scan errors are never a PASS (issue #1)', () => {
+  const ok = semgrepCoverage({ errors: [], paths: { scanned: ['a.cs', 'b.cs'] } }, []);
+  assert.equal(ok.status, 'OK');
+  assert.equal(semgrepCoverage({ errors: Array.from({ length: 5 }, (_, i) => ({ level: 'warn', path: `f${i}.cs` })), paths: { scanned: ['f0.cs', 'f1.cs', 'f2.cs', 'f3.cs', 'f4.cs'] } }, []).status, 'ERROR'); // nothing parsed
+  assert.equal(semgrepCoverage({ errors: [{ level: 'error', type: 'Rule parse error' }], paths: { scanned: ['a.cs'] } }, []).status, 'ERROR'); // rules did not load
+  assert.equal(semgrepCoverage({ errors: [{ level: 'error', type: 'Rule parse error' }], paths: { scanned: ['a.cs'] } }, [{ id: 'x' }]).status, 'PARTIAL');
+  assert.equal(semgrepCoverage({ errors: [], paths: { scanned: [] } }, []).status, 'ERROR'); // no files scanned
+  const many = Array.from({ length: 50 }, (_, i) => `f${i}.cs`);
+  assert.equal(semgrepCoverage({ errors: [{ level: 'warn', path: 'f1.cs' }], paths: { scanned: many } }, []).status, 'OK'); // one bad file of 50 is noted, not fatal
+  const res = (status, findings) => ({ tool: 'semgrep', status, findings });
+  assert.equal(evaluate([res('ERROR', [])], 'high').verdict, 'INCOMPLETE');
+  assert.equal(evaluate([res('PARTIAL', [{ severity: 'low' }])], 'high').verdict, 'INCOMPLETE');
+  assert.equal(evaluate([res('PARTIAL', [{ severity: 'high' }])], 'high').verdict, 'FAIL'); // what it did find still blocks
+});
+
+t('raw tool outputs lose secret text and matched lines before they are kept (issue #1)', () => {
+  const tv = redactRaw('trivy', { Results: [{ Secrets: [{ RuleID: 'aws', Match: 'AKIAREALKEY', Code: { Lines: [{ Content: 'key=AKIAREALKEY' }] } }] }] });
+  assert.ok(!JSON.stringify(tv).includes('AKIAREALKEY')); assert.equal(tv.Results[0].Secrets[0].RuleID, 'aws');
+  const sg = redactRaw('semgrep', { results: [{ check_id: 'r', extra: { lines: 'pwd="hunter2"', metavars: { $X: { abstract_content: 'hunter2' } }, message: 'm' } }] });
+  assert.ok(!JSON.stringify(sg).includes('hunter2')); assert.equal(sg.results[0].extra.message, 'm');
+  const zp = redactRaw('zap', { site: [{ alerts: [{ alert: 'a', instances: [{ uri: 'http://x/', evidence: 'token=abc123', otherinfo: 'abc123' }] }] }] });
+  assert.ok(!JSON.stringify(zp).includes('abc123')); assert.equal(zp.site[0].alerts[0].instances[0].uri, 'http://x/');
+});
+
+t('suppressions match exactly, not by substring (issue #1)', () => {
+  assert.ok(packageMatches('foo', 'foo@1.0.0')); assert.ok(packageMatches('foo@1.0.0', 'foo@1.0.0')); assert.ok(!packageMatches('foo', 'foobar@1.0.0'));
+  assert.ok(packageMatches('@scope/pkg', '@scope/pkg@2.0.0')); assert.ok(!packageMatches('foo@1.0.0', 'foo@1.0.1'));
+  assert.ok(pathMatches('src/a.cs', 'src/a.cs:12')); assert.ok(pathMatches('src/a.cs:12', 'src/a.cs:12')); assert.ok(!pathMatches('src/a', 'src/abc/x.cs:3'));
+  assert.ok(pathMatches('uSync/', 'uSync/v17/a.config:2')); assert.ok(!pathMatches('uSync', 'uSync/v17/a.config:2'));
+  assert.ok(pathMatches('Web.deps.json', 'published:Web: Web.deps.json')); // a "label: " prefix is ignored
+  const r = applyIgnores([{ tool: 'osv', id: 'CVE-1', package: 'foobar@1.0.0', location: 'x' }], [{ id: 'CVE-1', package: 'foo', reason: 'not used here', expires: '2999-01-01' }]);
+  assert.equal(r.active.length, 1); assert.equal(r.suppressed.length, 0);
+});
 
 t('owasp: findings land in the official OWASP Top 10:2025 category', () => {
   assert.deepEqual(cweList('CWE-89: Improper Neutralization'), [89]); assert.deepEqual(cweList(['CWE-79', 'CWE-79', '693']), [79, 693]); assert.deepEqual(cweList('-1'), []);
@@ -85,7 +119,8 @@ t('dast-auto: finds out how to start .NET, Node and Django apps', () => {
   const dirs = [];
   try {
     const net = mk({ 'src/Site/Site.csproj': '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>', 'src/Site/Program.cs': '', 'src/Site.Tests/Site.Tests.csproj': '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>', 'src/Lib/Lib.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>' }); dirs.push(net);
-    const a = detectApp(net); assert.equal(a.kind, 'dotnet'); assert.match(a.cmd, /dotnet run --project "src\/Site\/Site\.csproj" --urls http:\/\/localhost:\{port\}/); assert.equal(a.others, 1);
+    const a = detectApp(net); assert.equal(a.kind, 'dotnet'); assert.equal(a.cmd, 'dotnet run --project src/Site/Site.csproj --urls http://localhost:{port}'); assert.equal(a.others, 1);
+    assert.equal(a.file, 'dotnet'); assert.equal(a.args[2], path.join(net, 'src', 'Site', 'Site.csproj')); assert.ok(!a.needsShell); // path is an argument, never shell text
     const nodeNo = mk({ 'package.json': JSON.stringify({ scripts: { dev: 'next dev' }, dependencies: { next: '15' } }) }); dirs.push(nodeNo);
     const b = detectApp(nodeNo); assert.equal(b.kind, 'node'); assert.equal(b.cmd, 'npm run dev -- -p {port}'); assert.equal(b.problems.length, 1); // node_modules missing
     const nodeOk = mk({ 'package.json': JSON.stringify({ scripts: { start: 'node s.js' } }), 'node_modules/.keep': '' }); dirs.push(nodeOk);
@@ -105,6 +140,12 @@ t('dast-auto: a free port is found and an app that exits at once is reported, no
   try {
     const r = startApp({ command: `"${process.execPath}" -e "process.exit(3)"`, cwd: d, port: freePort(), logFile: path.join(d, 'app.log'), timeoutMs: 30000 });
     assert.equal(r.ok, false); assert.match(r.note, /exited before it answered/);
+    // A detected app runs without a shell: shell syntax in an argument (e.g. from a folder name) is passed as plain text.
+    const evil = 'x" & echo INJECTED & "; touch pwned; #';
+    const s = startApp({ file: process.execPath, args: ['-e', 'console.log("ARG=" + process.argv[1])', evil], cwd: d, port: freePort(), logFile: path.join(d, 'evil.log'), timeoutMs: 30000 });
+    assert.equal(s.ok, false);
+    const log = fs.readFileSync(path.join(d, 'evil.log'), 'utf8');
+    assert.ok(log.includes('ARG=' + evil)); assert.ok(!/^INJECTED/m.test(log)); assert.ok(!fs.existsSync(path.join(d, 'pwned')));
   } finally { fs.rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }); }
 });
 

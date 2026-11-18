@@ -28,7 +28,7 @@ caches in the Docker volumes `security-gate-grype-db` and `security-gate-trivy-c
 | `sast` | Semgrep | insecure code (security-audit, OWASP Top 10, C#, secrets rule packs) |
 | `secrets` | gitleaks | hard-coded secrets, working tree + git history |
 | `container` | Trivy + Grype | dependencies, IaC / Dockerfile misconfigurations, secrets (Trivy), container images (`--image`) |
-| `dast` | OWASP ZAP | running web app (needs `--dast-url`, or `--dast-auto` / `--dast-start` to let the gate start it) |
+| `dast` | OWASP ZAP | running web app (needs `--dast-url`, or `--dast-auto --i-trust-this-repo` / `--dast-start` to let the gate start it) |
 | `all` (default) | sca + sast + secrets + container | everything except DAST |
 
 `--dast-url` adds ZAP to any selection. `--tool` / `--only` produce a **partial scan**: the report says which tools the verdict covers.

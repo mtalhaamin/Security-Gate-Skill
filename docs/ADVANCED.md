@@ -13,7 +13,7 @@ node security-gate/scripts/gate.mjs [options]
   --only a,b / --skip a   tools: gitleaks, nuget, semgrep, osv, grype, trivy, zap  (--skip makes the gate INCOMPLETE)
   --image <ref>           scan a container image (repeatable)
   --dast-url <url>        add OWASP ZAP against a running app (local targets only)
-  --dast-auto             the gate starts your app itself (ASP.NET Core, Node.js, Django), scans it, then stops it
+  --dast-auto --i-trust-this-repo   the gate starts your app itself (ASP.NET Core, Node.js, Django), scans it, then stops it
   --dast-start "<cmd>"    same, with your own start command for any stack; write {port} where the port goes, e.g. "python app.py --port {port}"
   --dast-full --i-am-authorized   ACTIVE ZAP scan (attack traffic): only for apps you own
   --dast-allow-host <h>   allow a non-local DAST host you own  (repeatable)
@@ -28,6 +28,7 @@ node security-gate/scripts/gate.mjs [options]
   --exclude <glob>        extra semgrep exclude (repeatable)
   --ignore <file>         suppressions file (default: <root>/.security-gate/ignore.json)
   --keep                  keep the temp publish folder
+  --keep-raw              also keep zap.html (raw outputs are always redacted; zap.html is deleted by default)
 Environment: SECURITY_GATE_IMAGE_<TOOL> overrides an image, e.g. SECURITY_GATE_IMAGE_TRIVY=aquasec/trivy:latest
 ```
 
@@ -110,13 +111,16 @@ In `<project>/.work/security-gate/`:
 |---|---|
 | `security-report.pdf` | The report: summary, findings by severity and category, "Fix first", a clickable issue index and one numbered page per issue |
 | `report.md`, `report.json` | Same data as text / machine-readable (includes image digests) |
-| `gitleaks-*.json`, `osv-*.json`, `grype-*.json`, `trivy-*.json`, `semgrep.json`, `nuget-*.json`, `zap.json/html` | Raw tool output |
+| `gitleaks-*.json`, `osv-*.json`, `grype-*.json`, `trivy-*.json`, `semgrep.json`, `nuget-*.json`, `zap.json` | Raw tool output, for debugging. Secret values, matched source lines and ZAP evidence are removed before the files are kept; `zap.html` is kept only with `--keep-raw` |
+| `.gitignore` | Written into the report folder when it is inside the project (`*`), so `git add -A` never commits scan output |
 
 Rebuild the PDF any time: `node security-gate/scripts/report-pdf.mjs <report.json> [out.pdf]`.
 
 ## Hiding false alarms (suppressions)
 
 Create `<project>/.security-gate/ignore.json` (template: [`security-gate/references/ignore.example.json`](../security-gate/references/ignore.example.json)). Each entry needs `id`, a real `reason` and an `expires` date. Entries without these, or expired ones, are ignored and listed in the report so the finding counts again. Suppressed findings stay visible in the report.
+
+Matching is exact, never by substring: `"package": "foo"` matches `foo@1.0.0` but not `foobar@1.0.0` (use `"foo@1.0.0"` for one version); `"path": "src/a.cs"` matches that file on any line (or `"src/a.cs:12"` for one line), and a folder must end in `/` (`"uSync/"`), so `"src/a"` never hides `src/abc/...`.
 
 ## Use it in your AI coding tool
 
@@ -154,7 +158,7 @@ Real problems found while testing on an Umbraco (.NET) project:
 ## Safety rules
 
 - Scanners run in containers with the project mounted **read-only**. Only the report folder is writable.
-- `--dast-auto` and `--dast-start` run **your project's own code** on your computer (for example `dotnet run` or `npm run start`), on `localhost` only, and always stop it again. The app's output goes to `dast-app.log` in the report folder. Node.js projects need `npm install` done first; the gate never installs anything for you. Tested on ASP.NET Core and Node.js; Django is supported but not yet tested on a real project.
+- `--dast-auto` and `--dast-start` run **your project's own code** on your computer, so `--dast-auto` also needs `--i-trust-this-repo`. The detected start command is run without a shell, so a file or folder name in the project can never become a command. The app (for example `dotnet run` or `npm run start`) runs on `localhost` only and is always stopped again. The app's output goes to `dast-app.log` in the report folder. Node.js projects need `npm install` done first; the gate never installs anything for you. Tested on ASP.NET Core and Node.js; Django is supported but not yet tested on a real project.
 - Files and folders listed in your `.gitignore` are skipped by every scanner (gitleaks, Semgrep, OSV-Scanner, Grype, Trivy), because they are never committed. This needs a git repository; without one only the fixed folder list (`node_modules`, `bin`, `obj`, ...) is skipped. Docker images and the published .NET output are not affected.
 - Secret values are never copied: gitleaks runs with `--redact`; Semgrep and Trivy findings are cut down to rule + location. Secret files (`appsettings.Development.json`, `.env*`, `*.pfx`, ...) are excluded from Semgrep.
 - Local images are scanned through the Docker socket, which gives that container control of the Docker engine. Fine on a developer machine; avoid on shared CI runners (scan from the registry instead).

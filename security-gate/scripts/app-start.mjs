@@ -22,8 +22,14 @@ function findFiles(root, match, maxDepth = 3) {
   return out;
 }
 
-// Works out how to start the project's web app. Returns { kind, cmd, cwd, label, problems[] } or null.
-// The command contains {port}. Supported: ASP.NET Core, Node.js (Next.js, Vite, anything that reads PORT) and Django.
+// Works out how to start the project's web app. Returns { kind, file, args, cwd, cmd, label, problems[] } or null.
+// file + args are run WITHOUT a shell, so a file or folder name in the scanned repository can never become part of a
+// shell command; {port} in args is replaced at start. cmd is only for display.
+// Supported: ASP.NET Core, Node.js (Next.js, Vite, anything that reads PORT) and Django.
+const NPM_CLI = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+function npmCall(args) { // npm is a .cmd on Windows, which cannot run without a shell: call npm's own script with node instead
+  return fs.existsSync(NPM_CLI) ? { file: process.execPath, args: [NPM_CLI, ...args] } : { file: process.platform === 'win32' ? 'npm.cmd' : 'npm', args, needsShell: process.platform === 'win32' };
+}
 export function detectApp(root) {
   const rel = (p) => path.relative(root, p).split(path.sep).join('/') || '.';
 
@@ -33,7 +39,8 @@ export function detectApp(root) {
     const ranked = [...webProjects].sort((a, b) => score(a) - score(b));
     function score(p) { return (/test/i.test(p) ? 10 : 0) + (fs.existsSync(path.join(path.dirname(p), 'Program.cs')) ? 0 : 1); }
     const p = ranked[0];
-    return { kind: 'dotnet', cwd: root, cmd: `dotnet run --project "${rel(p)}" --urls http://localhost:{port}`, label: `ASP.NET Core project ${rel(p)}`,
+    const args = ['run', '--project', p, '--urls', 'http://localhost:{port}'];
+    return { kind: 'dotnet', cwd: root, file: 'dotnet', args, cmd: `dotnet run --project ${rel(p)} --urls http://localhost:{port}`, label: `ASP.NET Core project ${rel(p)}`,
       problems: [], others: webProjects.length - 1 };
   }
 
@@ -42,15 +49,13 @@ export function detectApp(root) {
     const p = pkgs[0]; const dir = path.dirname(p); const j = parseJson(read(p));
     const deps = { ...(j.dependencies || {}), ...(j.devDependencies || {}) };
     const script = j.scripts.dev ? 'dev' : 'start';
-    let extra = '';
-    if (deps.next) extra = ' -- -p {port}';
-    else if (deps.vite) extra = ' -- --port {port} --strictPort';
+    const extra = deps.next ? ['--', '-p', '{port}'] : deps.vite ? ['--', '--port', '{port}', '--strictPort'] : [];
     const problems = fs.existsSync(path.join(dir, 'node_modules')) ? [] : [`dependencies are not installed in ${rel(dir)}; run "npm install" there first`];
-    return { kind: 'node', cwd: dir, cmd: `npm run ${script}${extra}`, label: `Node.js project ${rel(dir)} (npm run ${script})`, problems, others: pkgs.length - 1 };
+    return { kind: 'node', cwd: dir, ...npmCall(['run', script, ...extra]), cmd: ['npm', 'run', script, ...extra].join(' '), label: `Node.js project ${rel(dir)} (npm run ${script})`, problems, others: pkgs.length - 1 };
   }
 
   const manage = findFiles(root, (n) => n === 'manage.py', 2)[0];
-  if (manage) return { kind: 'django', cwd: path.dirname(manage), cmd: 'python manage.py runserver {port} --noreload', label: `Django project ${rel(path.dirname(manage))}`, problems: [], others: 0 };
+  if (manage) return { kind: 'django', cwd: path.dirname(manage), file: process.platform === 'win32' ? 'python' : 'python3', args: ['manage.py', 'runserver', '{port}', '--noreload'], cmd: 'python manage.py runserver {port} --noreload', label: `Django project ${rel(path.dirname(manage))}`, problems: [], others: 0 };
 
   return null;
 }
@@ -77,12 +82,17 @@ function httpAnswers(url) { // any HTTP answer (even 404 or 500) means the serve
 }
 
 // Starts the app and waits until it answers. Returns { ok, url, pid, log, note }.
-export function startApp({ command, cwd, port, logFile, timeoutMs = 4 * 60 * 1000, env = {} }) {
-  const cmd = command.replace(/\{port\}/g, String(port));
+// Either { file, args } (detected app: no shell, so nothing from the repository is interpreted) or { command } (the user's
+// own --dast-start line, run through the shell because the user wrote it).
+export function startApp({ command, file, args = [], needsShell = false, cwd, port, logFile, timeoutMs = 4 * 60 * 1000, env = {} }) {
+  const P = String(port);
+  const fileArgs = args.map((a) => String(a).replace(/\{port\}/g, P));
+  const cmd = file ? [file, ...fileArgs].join(' ') : command.replace(/\{port\}/g, P);
   const url = `http://localhost:${port}`;
   const fd = fs.openSync(logFile, 'w');
   const win = process.platform === 'win32';
-  const child = spawn(cmd, { cwd, shell: true, detached: !win, windowsHide: true, stdio: ['ignore', fd, fd], env: { ...process.env, PORT: String(port), ...env } });
+  const opts = { cwd, detached: !win, windowsHide: true, stdio: ['ignore', fd, fd], env: { ...process.env, PORT: P, ...env } };
+  const child = file ? spawn(file, fileArgs, { ...opts, shell: needsShell }) : spawn(cmd, { ...opts, shell: true });
   child.on('error', () => { /* reported through the log and the wait loop */ });
   fs.closeSync(fd); // the child keeps its own copy; closing ours lets the log file be deleted on Windows
   const handle = { pid: child.pid, url, log: logFile, cmd };

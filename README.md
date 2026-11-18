@@ -87,7 +87,7 @@ Add these to the step 3 command:
 | Check only libraries | `--tool sca` |
 | Check only my code | `--tool sast` |
 | Scan a Docker image | `--tool container --image myapp:1.0` |
-| Scan my website and let the gate start it for me (.NET, Node.js, Django) | `--dast-auto` |
+| Scan my website and let the gate start it for me (.NET, Node.js, Django) | `--dast-auto --i-trust-this-repo` |
 | Scan my website that is already running (your own, on your computer) | `--dast-url http://localhost:5000` |
 | Fail on smaller problems too | `--fail-on medium` |
 
@@ -105,7 +105,7 @@ Files listed in your `.gitignore` are skipped by every scanner.
 
 **How the OWASP ZAP check works:** ZAP does not read your code. It visits your running website like a browser and looks for weak spots such as missing security headers or outdated scripts. So the site must be running, on your own computer:
 
-- `--dast-auto`: the gate starts your app (.NET, Node.js or Django), scans it, and stops it again. You do nothing.
+- `--dast-auto --i-trust-this-repo`: the gate starts your app (.NET, Node.js or Django), scans it, and stops it again. Because this runs the project's own code, the extra flag is required: use it only for code you trust.
 - `--dast-url http://localhost:5000`: you start the app yourself and give the address.
 - By default ZAP only **looks** (passive scan, no attacks). An attacking scan needs `--dast-full --i-am-authorized` and is for apps you own.
 
