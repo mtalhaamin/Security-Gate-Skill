@@ -22,6 +22,11 @@ t('semgrep: scan errors are never a PASS (issue #1)', () => {
   assert.equal(semgrepCoverage({ errors: [], paths: { scanned: [] } }, []).status, 'ERROR'); // no files scanned
   const many = Array.from({ length: 50 }, (_, i) => `f${i}.cs`);
   assert.equal(semgrepCoverage({ errors: [{ level: 'warn', path: 'f1.cs' }], paths: { scanned: many } }, []).status, 'OK'); // one bad file of 50 is noted, not fatal
+  // Partly parsed files still count as scanned, so the result is OK (real case: 28 of 111 C# files)
+  const part = Array.from({ length: 28 }, (_, i) => ({ level: 'warn', type: ['PartialParsing', [{ path: `p${i}.cs` }]], path: `p${i}.cs` }));
+  const pc = semgrepCoverage({ errors: part, paths: { scanned: Array.from({ length: 111 }, (_, i) => `p${i}.cs`) } }, []);
+  assert.equal(pc.status, 'OK'); assert.match(pc.note, /28 parsed partially/);
+  assert.equal(semgrepCoverage({ errors: [...part, { level: 'error', type: 'Rule parse error' }], paths: { scanned: ['a.cs'] } }, []).status, 'ERROR'); // a real rule error still counts
   const res = (status, findings) => ({ tool: 'semgrep', status, findings });
   assert.equal(evaluate([res('ERROR', [])], 'high').verdict, 'INCOMPLETE');
   assert.equal(evaluate([res('PARTIAL', [{ severity: 'low' }])], 'high').verdict, 'INCOMPLETE');

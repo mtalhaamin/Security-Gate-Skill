@@ -546,20 +546,28 @@ function runSemgrep(ctx) {
   const cov = semgrepCoverage(extractJson(text), findings);
   return { status: cov.status, findings, note: `rulesets: ${configs.join(', ')}; ${cov.note}` };
 }
-// Semgrep exits 0 even when rules fail to load or files cannot be parsed; it lists those in errors[]. A scan is only
-// trusted ("OK") when no rule/config error happened and at least most of the scanned files were read cleanly.
-// ERROR / PARTIAL are not PASS, so evaluate() turns them into INCOMPLETE (PARTIAL with blocking findings still FAILs).
+// Checks if semgrep really scanned the code. Semgrep can finish "successfully" even when rules or files failed,
+// so we read its error list:
+// - a rule error, or no files scanned: the scan did not really run (ERROR, or PARTIAL if it still found something)
+// - more than 20% of files could not be read: also not trusted
+// - otherwise: OK
+// ERROR and PARTIAL never give a PASS.
 export function semgrepCoverage(obj, findings = []) {
   const errors = Array.isArray(obj?.errors) ? obj.errors : [];
-  const fatal = errors.filter((e) => String(e.level || '').toLowerCase() === 'error' || !e.path);
-  const badFiles = new Set(errors.filter((e) => e.path && !fatal.includes(e)).map((e) => e.path));
+  // "PartialParsing" = the file was scanned, only a few new-syntax lines were skipped. Not a failure, only noted.
+  const isPartial = (e) => /PartialParsing/i.test(Array.isArray(e.type) ? String(e.type[0]) : String(e.type || ''));
+  const partFiles = new Set(errors.filter(isPartial).map((e) => e.path || '?'));
+  const real = errors.filter((e) => !isPartial(e));
+  const fatal = real.filter((e) => String(e.level || '').toLowerCase() === 'error' || !e.path);
+  const badFiles = new Set(real.filter((e) => e.path && !fatal.includes(e)).map((e) => e.path));
   const scanned = Array.isArray(obj?.paths?.scanned) ? obj.paths.scanned.length : null;
   const share = scanned ? badFiles.size / scanned : 1;
   const notRun = (why) => ({ status: findings.length ? 'PARTIAL' : 'ERROR', note: why });
   if (fatal.length) return notRun(`${fatal.length} rule/config error(s): semgrep did not run all rules (see semgrep.json)`);
   if (scanned === 0) return notRun('semgrep scanned no files');
   if (badFiles.size && (scanned === null || share > 0.2)) return notRun(`${badFiles.size} of ${scanned ?? '?'} files could not be parsed: coverage is partial`);
-  return { status: 'OK', note: `${scanned ?? '?'} files scanned${badFiles.size ? `, ${badFiles.size} could not be parsed (see semgrep.json)` : ''}` };
+  const extra = [badFiles.size ? `${badFiles.size} could not be parsed` : '', partFiles.size ? `${partFiles.size} parsed partially (newer syntax skipped)` : ''].filter(Boolean).join(', ');
+  return { status: 'OK', note: `${scanned ?? '?'} files scanned${extra ? `, ${extra} (see semgrep.json)` : ''}` };
 }
 // OSV-Scanner is pointed at each top-level project folder (not the repo root) so dot-folders such as .claude, .git
 // and .work (tooling, not product code) are never scanned; the same folders semgrep, grype and trivy exclude.
