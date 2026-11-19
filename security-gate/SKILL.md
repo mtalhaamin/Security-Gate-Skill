@@ -1,23 +1,46 @@
 ---
 name: security-gate
 description: >
-  One security gate for a codebase, run through official Docker images: OSV-Scanner + NuGet Audit (SCA), Semgrep (SAST),
-  gitleaks (secrets), Trivy + Grype (dependencies, IaC, container images) and OWASP ZAP (DAST, local targets only). Returns a single
-  PASS / FAIL / INCOMPLETE verdict and a PDF report that ranks findings L0 High / L1 Medium / L2 Low. Use when the user asks to run the
-  security gate, scan the repo or a container image for secrets/vulnerabilities, run DAST/ZAP, check it is clean before a
-  commit/PR/release, or mentions gitleaks, semgrep, osv-scanner, grype, trivy, ZAP or NuGet audit.
+  Use to security-scan a codebase or container image before a commit, PR or release. Runs gitleaks, Semgrep, OSV-Scanner,
+  NuGet Audit, Trivy, Grype and OWASP ZAP in Docker; gives PASS/FAIL and a PDF.
+license: MIT
+compatibility: Needs Docker, Node 20+ and a shell. The .NET SDK is needed only for .NET projects.
+metadata:
+  author: Muhammad Talha (mtalhaamin)
+  version: "1.2.0"
+  tags: [security, sast, sca, dast, owasp]
 ---
 
 # security-gate
 
-Agent-neutral (Agent Skills format): works in Claude Code, Cursor, Codex and Antigravity. The runner is a plain Node script, so any
-agent that can run a shell command can use it. Skill folders: `.claude/skills/` (Claude Code), `.cursor/skills/` (Cursor),
-`.agents/skills/` (Codex, Antigravity, also read by Cursor), `~/.gemini/antigravity/skills/` (Antigravity, global).
+## Purpose
 
-Every scanner runs in its **official Docker image**; nothing is installed on the machine. Needs **Docker Desktop**, the **.NET SDK**
-(NuGet Audit and publish) and **Node 20+**. The scanned project is passed with `--root`; reports go to `<root>/.work/security-gate/`.
+One command that checks a project for security problems before it goes live: leaked secrets, vulnerable libraries, risky code,
+container and IaC settings and, if asked, a scan of the running web app. It gives one PASS / FAIL / INCOMPLETE verdict and a PDF
+report mapped to the OWASP Top 10:2025.
 
+Works in any agent that can run a shell command (Claude Code, Cursor, Codex, Antigravity and others). Skill folders:
+`.claude/skills/` (Claude Code), `.cursor/skills/` (Cursor), `.agents/skills/` (Codex, Antigravity, also read by Cursor),
+`~/.gemini/antigravity/skills/` (Antigravity, global).
+
+## Prerequisites
+
+- **Docker Desktop** (or another Docker engine). Every scanner runs in its official Docker image; nothing else is installed.
+- **Node 20+** to run the scripts.
+- **.NET SDK 8+** only for .NET projects (NuGet Audit and publish).
+- No API keys or accounts.
+
+The scanned project is passed with `--root`; reports go to `<root>/.work/security-gate/`.
 `<skill-dir>` below = the folder that contains this SKILL.md.
+
+## Available Scripts
+
+| Script | Purpose | Arguments |
+|---|---|---|
+| `scripts/gate.mjs` | Runs the scanners and writes the reports | `--root <project>`, `--tool <groups>`, `--image <name:tag>`, `--dast-url <url>`, `--fail-on <level>`, `--preflight` (see Instructions) |
+| `scripts/report-pdf.mjs` | Rebuilds only the PDF from a saved report | `<out>/report.json [out.pdf]` |
+| `scripts/gate.selftest.mjs` | Offline self-test, no Docker needed | none |
+| `scripts/app-start.mjs` | Used by `--dast-auto` to start and stop the app | none (not run directly) |
 
 ## Hard rules
 
@@ -33,7 +56,7 @@ Every scanner runs in its **official Docker image**; nothing is installed on the
    not run, or if the report says "Partial scan by request" (then say which tools the verdict covers).
 5. Do not suppress a finding, lower `--fail-on`, or use `--skip` to get a green result unless the user asked for exactly that.
 
-## Procedure
+## Instructions
 
 1. **Preflight** (changes nothing): `node <skill-dir>/scripts/gate.mjs --preflight` shows Docker, the .NET SDK and which images are
    already local or will be pulled. Docker Desktop is started automatically on a real run (Windows).
@@ -54,6 +77,36 @@ Every scanner runs in its **official Docker image**; nothing is installed on the
    file:line, fixed version if known), and what the user must do themself (rotate leaked credentials, approve downloads).
 4. **Fix loop** when asked to fix: see "Fixing" below, then re-run the gate until PASS. Report any remaining finding honestly instead of
    suppressing it.
+
+## Examples
+
+Full scan of a project (all groups except DAST):
+
+```bash
+node <skill-dir>/scripts/gate.mjs --root ./my-project
+```
+
+Only secrets and code checks, failing on medium and above:
+
+```bash
+node <skill-dir>/scripts/gate.mjs --root ./my-project --tool secrets,sast --fail-on medium
+```
+
+Scan a container image, then a web app already running on port 5000:
+
+```bash
+node <skill-dir>/scripts/gate.mjs --root ./my-project --image myapp:1.0
+node <skill-dir>/scripts/gate.mjs --root ./my-project --dast-url http://localhost:5000
+```
+
+Example answer to the user after a run:
+
+```text
+Verdict: FAIL (grade D, 77/100), 5 of 6 checks ran.
+- gitleaks: PASS. Semgrep: PASS. OSV/Grype: 0 blocking.
+- Trivy: 1 high, KSV-0014 (k8s/deployment.yml:20): set readOnlyRootFilesystem: true.
+Report: .work/security-gate/security-report.pdf
+```
 
 ## Verdict and exit codes
 
@@ -88,17 +141,34 @@ and A01 Broken Access Control is only partly covered by scanners.
 
 ## Suppressions (accepted risk)
 
-File `<root>/.security-gate/ignore.json` (see `references/ignore.example.json`). Each entry needs `id`, a real `reason` and an `expires`
+File `<root>/.security-gate/ignore.json` (see `assets/ignore.example.json`). Each entry needs `id`, a real `reason` and an `expires`
 date (YYYY-MM-DD); entries without these, or expired, are ignored and listed in the report so the finding counts again. Suppressed
 findings stay visible in the report.
 
-## Limits to tell the user
+## Limitations
+
+Tell the user these when they matter:
 
 - OSV-Scanner, Grype and Trivy read .NET packages from `deps.json` / lock files; the runner publishes web/exe projects to a temp
   folder (outside the repo, deleted afterwards) to provide that. If publish fails the report says so.
 - Gitleaks `git` needs at least one commit; a repo without commits gets a working-tree scan only (noted).
 - Scanners report known issues only. A PASS is not a penetration test; the ZAP baseline is passive only.
+- Gitleaks finds only secrets that match its rules. The gate adds one rule for signed Power Automate / Logic Apps links;
+  other custom secrets can still be missed. A project's own `.gitleaks.toml` replaces the gate's config (and this extra rule).
+- Scanning a local Docker image mounts the Docker socket into the Trivy and Grype containers (official pinned images only).
 - Details, image list, severity mapping, CI use: `references/tools.md`.
+
+## Troubleshooting
+
+| Error | Cause | Solution |
+|---|---|---|
+| `Docker is not running and could not be started` | Docker Desktop is closed or still starting | Start Docker Desktop, wait until it is ready, run again |
+| `... is not pulled and --no-pull was given` | A scanner image is not on this computer | Ask the user, then run without `--no-pull` (`--preflight` shows sizes) |
+| NuGet shows `needs .NET SDK 8+` or `dotnet restore failed` | .NET SDK missing or the project does not restore | Install the .NET SDK 8+ or fix the restore error, run again |
+| Semgrep `ERROR` with `rule/config error(s)` | Rules could not be downloaded or a custom ruleset is wrong | Check the network and `--semgrep-config`; details are in `semgrep.json` |
+| A tool shows `NO-COVERAGE` | No lock files or manifests found for that tool | Check `--root` points at the project; restore or build first |
+| `refusing to scan <host>` | DAST target is not localhost | Use a local URL, or `--dast-allow-host <host>` only if the user owns that host |
+| `git history: repository has no commits yet` | New repo without commits | Normal: the working tree is still scanned |
 
 ## Self-test (no Docker needed)
 

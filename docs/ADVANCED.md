@@ -118,7 +118,7 @@ Rebuild the PDF any time: `node security-gate/scripts/report-pdf.mjs <report.jso
 
 ## Hiding false alarms (suppressions)
 
-Create `<project>/.security-gate/ignore.json` (template: [`security-gate/references/ignore.example.json`](../security-gate/references/ignore.example.json)). Each entry needs `id`, a real `reason` and an `expires` date. Entries without these, or expired ones, are ignored and listed in the report so the finding counts again. Suppressed findings stay visible in the report.
+Create `<project>/.security-gate/ignore.json` (template: [`security-gate/assets/ignore.example.json`](../security-gate/assets/ignore.example.json)). Each entry needs `id`, a real `reason` and an `expires` date. Entries without these, or expired ones, are ignored and listed in the report so the finding counts again. Suppressed findings stay visible in the report.
 
 Matching is exact, never by substring: `"package": "foo"` matches `foo@1.0.0` but not `foobar@1.0.0` (use `"foo@1.0.0"` for one version); `"path": "src/a.cs"` matches that file on any line (or `"src/a.cs:12"` for one line), and a folder must end in `/` (`"uSync/"`), so `"src/a"` never hides `src/abc/...`.
 
