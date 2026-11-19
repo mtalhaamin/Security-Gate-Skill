@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { detectApp, startApp, freePort } from './app-start.mjs';
 import { securityScore, buildHtml, owaspCategory } from './report-pdf.mjs';
-import { cweList, semgrepCoverage, redactRaw, packageMatches, pathMatches } from './gate.mjs';
+import { cweList, semgrepCoverage, redactRaw, packageMatches, pathMatches, GITLEAKS_EXTRA_RULES } from './gate.mjs';
 import { parseIgnoredList, trivySkipArgs, looksLikeGuidOnly, semgrepRulesets, detectLanguages, parseGitleaks, parseDotnetList, parseSemgrep, parseOsv, parseGrype, parseTrivy, parseZap, checkDastTarget, chooseRuntime, selectTools, applyIgnores, evaluate, extractJson, cvssToSeverity } from './gate.mjs';
 
 let n = 0; const t = (name, fn) => { fn(); n++; console.log('ok  ' + name); };
@@ -106,6 +106,17 @@ t('gitleaks: never copies the secret', () => {
   const f = parseGitleaks(JSON.stringify([{ RuleID: 'aws-access-token', Description: 'key', File: 'a/b.cs', StartLine: 7, Secret: 'REDACTED', Match: 'REDACTED', Commit: 'abcdef123456', Fingerprint: 'fp1' }]));
   assert.equal(f.length, 1); assert.equal(f[0].severity, 'critical'); assert.equal(f[0].location, 'a/b.cs:7 @abcdef12');
   assert.ok(!JSON.stringify(f).includes('REDACTED'));
+});
+
+t('gitleaks: extra rule catches signed Power Automate / Logic Apps links, not normal links', () => {
+  // Same regex gitleaks gets; JS needs the "i" flag instead of Go's (?i). All URLs below are fake.
+  const src = GITLEAKS_EXTRA_RULES.match(/regex = '''(.+)'''/)[1];
+  const re = new RegExp(src.replace('(?i)', ''), 'i');
+  assert.ok(re.test('https://prod-12.westeurope.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?api-version=2016-06-01&sv=1.0&sig=FAKEfakeFAKEfake1234567890'));
+  assert.ok(re.test('https://x.environment.api.powerplatform.com/powerautomate/automations/direct/workflows/abc/triggers/manual/paths/invoke?sig=TESTtestTESTtest_-0987654321'));
+  assert.ok(!re.test('https://learn.microsoft.com/azure/logic-apps/?sig=FAKEfakeFAKEfake1234567890')); // other host
+  assert.ok(!re.test('https://prod-1.westeurope.logic.azure.com/workflows/abc?sig=short')); // too short to be a key
+  assert.match(GITLEAKS_EXTRA_RULES, /secretGroup = 1/); // only the key is the secret, so --redact hides it
 });
 
 t('gitleaks: generic rule is High, GUID-only line is Low + labelled, real-looking value stays High', () => {

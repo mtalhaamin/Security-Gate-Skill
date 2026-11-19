@@ -472,6 +472,17 @@ export function redactRaw(kind, obj) {
 function redactFile(file, kind) {
   try { const obj = extractJson(fs.readFileSync(file, 'utf8')); if (obj) fs.writeFileSync(file, JSON.stringify(redactRaw(kind, obj))); } catch { /* nothing to redact */ }
 }
+// Extra gitleaks rules, added on top of the default ones.
+// Power Automate / Logic Apps / Teams Workflows links carry a "sig=" key: anyone who has the link can trigger the flow.
+// gitleaks has no rule for them, so they were missed before.
+export const GITLEAKS_EXTRA_RULES = String.raw`
+[[rules]]
+id = "azure-workflow-signed-url"
+description = "Signed Power Automate / Logic Apps webhook URL (anyone with the link can trigger it)"
+regex = '''(?i)https://[a-z0-9.-]+\.(?:logic\.azure\.com|powerplatform\.com)(?::443)?/[^\s'"<>]*?[?&]sig=([a-z0-9_%\-]{20,})'''
+secretGroup = 1
+keywords = ["sig="]
+`;
 function gitleaksConfig(ctx) {
   for (const f of ['.gitleaks.toml', 'gitleaks.toml']) {
     if (fs.existsSync(path.join(ctx.root, f))) return { arg: `${DP.root}/${f}`, note: `using project config ${f}` };
@@ -483,7 +494,7 @@ function gitleaksConfig(ctx) {
   const paths = [...ig.dirs, ...ig.files]
     .map((p) => `(^|${sep})${esc(p).replace(/\//g, sep)}(${sep}|$)`);
   paths.push(`(^|${sep})(node_modules|bin|obj|\\.git|\\.work)${sep}`);
-  fs.writeFileSync(path.join(ctx.out, 'gitleaks.config.toml'), `[extend]\nuseDefault = true\n\n[[allowlists]]\ndescription = "gitignored and generated paths"\npaths = [\n${paths.map((p) => `  '''${p}'''`).join(',\n')}\n]\n`);
+  fs.writeFileSync(path.join(ctx.out, 'gitleaks.config.toml'), `[extend]\nuseDefault = true\n${GITLEAKS_EXTRA_RULES}\n[[allowlists]]\ndescription = "gitignored and generated paths"\npaths = [\n${paths.map((p) => `  '''${p}'''`).join(',\n')}\n]\n`);
   return { arg: `${DP.out}/gitleaks.config.toml`, note: `${paths.length} ignored paths allow-listed` };
 }
 function runGitleaks(ctx) {
